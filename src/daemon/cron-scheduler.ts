@@ -74,7 +74,17 @@ function expandField(field: string, min: number, max: number): number[] {
  * expression, starting from `fromMs` (exclusive — the next fire must be
  * strictly after fromMs, rounded forward to the next whole minute).
  *
- * @param expr   - 5-field cron expression ("min hour dom month dow").
+ * Cron fields are interpreted in **UTC**, deliberately and unconditionally.
+ * This function is called from two processes that do not share a TZ: the
+ * daemon scheduler (which decides when a cron actually fires) and the
+ * `bus list-crons` CLI (which prints the "Next Fire" column, labelled UTC).
+ * Reading the fields in local time made the answer depend on each process's
+ * `TZ` env var, so the two disagreed by the UTC offset whenever they differed
+ * — and `cortextos start` passes `{...process.env}` straight to the spawned
+ * daemon, so a daemon started from a shell with `TZ` set would silently shift
+ * every cron-expression schedule.
+ *
+ * @param expr   - 5-field cron expression ("min hour dom month dow"), in UTC.
  * @param fromMs - Starting epoch time in milliseconds.
  * @returns      Epoch ms of the next matching minute, or NaN if unparseable.
  */
@@ -104,11 +114,11 @@ export function nextFireFromCron(expr: string, fromMs: number): number {
 
   for (let i = 0; i < MAX_MINUTES; i++) {
     const d = new Date(candidate);
-    const m  = d.getMinutes();
-    const h  = d.getHours();
-    const dy = d.getDate();
-    const mo = d.getMonth() + 1; // 1-12
-    const dw = d.getDay();       // 0-6
+    const m  = d.getUTCMinutes();
+    const h  = d.getUTCHours();
+    const dy = d.getUTCDate();
+    const mo = d.getUTCMonth() + 1; // 1-12
+    const dw = d.getUTCDay();       // 0-6
 
     if (
       months.includes(mo) &&
