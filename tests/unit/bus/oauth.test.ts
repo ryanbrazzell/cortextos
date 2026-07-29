@@ -274,6 +274,43 @@ describe('checkUsageApi', () => {
     expect(call[1].headers['anthropic-beta']).toBe('oauth-2025-04-20');
   });
 
+  it('verifies the caller-pinned credential instead of re-reading the store', async () => {
+    // The contract rotateOAuth depends on. Tested HERE, directly, because it is
+    // not observable through rotateOAuth in a single process: nothing awaits
+    // between rotateOAuth capturing the token and this function reading the
+    // store, so the two always agree in-process and a build that ignored
+    // `accessToken` would pass every rotation test.
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: 0.1, seven_day_utilization: 0.05 }),
+    });
+
+    await checkUsageApi(tmpDir, {
+      force: true,
+      account: 'secondary',
+      accessToken: 'tok_pinned_not_in_store',
+    });
+
+    // The store holds tok_secondary_def for this account; the pin must win.
+    expect(mockFetch.mock.calls[0][1].headers.Authorization)
+      .toBe('Bearer tok_pinned_not_in_store');
+  });
+
+  it('falls back to the named account store token when no credential is pinned', async () => {
+    // The other half of the branch. Without this, pinning could swallow the
+    // ordinary path (the CLI's `bus usage --account X`) and nothing would fail.
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: 0.1, seven_day_utilization: 0.05 }),
+    });
+
+    await checkUsageApi(tmpDir, { force: true, account: 'secondary' });
+
+    expect(mockFetch.mock.calls[0][1].headers.Authorization).toBe('Bearer tok_secondary_def');
+  });
+
   it('performs the utilization write under the inter-process lock', async () => {
     // checkUsageApi awaits the usage API and then rewrites the WHOLE store, so
     // it has the same read-modify-write exposure as the refresh path. In one
@@ -979,6 +1016,110 @@ describe('rotateOAuth — active account moved during preflight', () => {
     expect(store.rotation_log[0].from).toBe('primary');
     expect(store.rotation_log[0].to).toBe('secondary');
     expect(store.rotation_log[1].from).toBe('older');
+  });
+
+  /*
+   * The preflight proves a TOKEN works. Every guard above compares NAMES —
+   * `active`, and the destination still existing under `nextName`. A concurrent
+   * refresh (or an admin edit) that swaps the destination's credential inside
+   * the preflight window moves neither name, so both existing predicates report
+   * "no race" while the thing that was verified and the thing about to be
+   * distributed have become two different tokens.
+   */
+  it('aborts when the destination credential is swapped between preflight and commit', async () => {
+    writeStore(THREE_ACCOUNT_STORE);
+    const preflight = deferredFetch();
+    mockFetch.mockImplementationOnce(() => preflight.promise);
+
+    const call = rotateOAuth(tmpDir, '/tmp/fw', 'acme');
+
+    // active stays 'primary' and no rotation commits — the ONLY thing that
+    // changes is secondary's access_token, so this arm can only be caught by a
+    // predicate that compares the credential itself.
+    overwriteStore((s) => { s!.accounts.secondary.access_token = 'tok_secondary_REFRESHED'; });
+
+    preflight.resolve(usageResponse(0.1, 0.05));
+    const result = await call;
+
+    expect(result.rotated).toBe(false);
+    expect(result.reason).toMatch(/credential/i);
+    // Distinct from the two superseded messages: nothing superseded this
+    // rotation, the destination moved underneath it.
+    expect(result.reason).not.toMatch(/superseded/i);
+
+    const store = loadAccounts(tmpDir)!;
+    expect(store.active).toBe('primary');
+    expect(store.rotation_log).toHaveLength(0);
+  });
+
+  it('leaves agent .env files untouched when the destination credential moved', async () => {
+    // The user-visible harm, and the reason aborting beats taking the newer
+    // token: phase 2 writes to EVERY agent .env at once, so a rotation that ran
+    // on a stale premise disturbs the whole org simultaneously.
+    //
+    // Named for what it actually detects. It pins that phase 2 does not RUN,
+    // not that an unpreflighted token is filtered out — with phase 2 bound to
+    // `preflightedToken`, deleting only the in-lock credential check still
+    // distributes the preflighted token, so this arm goes red on the .env
+    // having been rewritten at all.
+    const { mkdirSync, writeFileSync } = require('fs');
+    const fwRoot = mkdtempSync(join(tmpdir(), 'cortextos-fw-'));
+    const envPath = join(fwRoot, 'orgs', 'acme', 'agents', 'rally-builder', '.env');
+    mkdirSync(join(fwRoot, 'orgs', 'acme', 'agents', 'rally-builder'), { recursive: true });
+    writeFileSync(envPath, 'CLAUDE_CODE_OAUTH_TOKEN=tok_primary_abc\n');
+
+    try {
+      writeStore(THREE_ACCOUNT_STORE);
+      const preflight = deferredFetch();
+      mockFetch.mockImplementationOnce(() => preflight.promise);
+
+      const call = rotateOAuth(tmpDir, fwRoot, 'acme');
+      overwriteStore((s) => { s!.accounts.secondary.access_token = 'tok_secondary_REFRESHED'; });
+      preflight.resolve(usageResponse(0.1, 0.05));
+
+      const result = await call;
+      // The .env content is asserted FIRST and deliberately: a `rotated` check
+      // ahead of it throws before these ever run, which makes this arm a
+      // duplicate of the one above and leaves the claim in its name untested.
+      const env = readFileSync(envPath, 'utf-8');
+      // Unguarded, phase 2 reads the store fresh and ships the swapped-in token.
+      expect(env).not.toContain('tok_secondary_REFRESHED');
+      expect(env).toContain('tok_primary_abc');
+      expect(result.rotated).toBe(false);
+    } finally {
+      rmSync(fwRoot, { recursive: true, force: true });
+    }
+  });
+
+  /*
+   * Vacuity arm. A credential predicate that never matched would abort every
+   * rotation, and both arms above would still pass — "it aborted" is the
+   * expected result there. This is the arm that fails if the guard fires on a
+   * store nobody touched, and it also pins that the committed rotation actually
+   * distributes the preflighted token rather than nothing at all.
+   */
+  it('still commits and distributes the preflighted token when the credential is untouched', async () => {
+    const { mkdirSync, writeFileSync } = require('fs');
+    const fwRoot = mkdtempSync(join(tmpdir(), 'cortextos-fw-'));
+    const envPath = join(fwRoot, 'orgs', 'acme', 'agents', 'rally-builder', '.env');
+    mkdirSync(join(fwRoot, 'orgs', 'acme', 'agents', 'rally-builder'), { recursive: true });
+    writeFileSync(envPath, 'CLAUDE_CODE_OAUTH_TOKEN=tok_primary_abc\n');
+
+    try {
+      writeStore(THREE_ACCOUNT_STORE);
+      const preflight = deferredFetch();
+      mockFetch.mockImplementationOnce(() => preflight.promise);
+
+      const call = rotateOAuth(tmpDir, fwRoot, 'acme');
+      preflight.resolve(usageResponse(0.1, 0.05));
+      const result = await call;
+
+      expect(result.rotated, `rotation was blocked with: ${result.reason}`).toBe(true);
+      expect(loadAccounts(tmpDir)!.active).toBe('secondary');
+      expect(readFileSync(envPath, 'utf-8')).toContain('tok_secondary_def');
+    } finally {
+      rmSync(fwRoot, { recursive: true, force: true });
+    }
   });
 });
 

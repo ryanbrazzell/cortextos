@@ -235,7 +235,7 @@ function saveCache(ctxRoot: string, snapshot: UsageSnapshot): void {
  */
 export async function checkUsageApi(
   ctxRoot: string,
-  opts: { force?: boolean; account?: string } = {},
+  opts: { force?: boolean; account?: string; accessToken?: string } = {},
 ): Promise<CheckUsageResult> {
   // Check cache first (unless force)
   if (!opts.force) {
@@ -250,11 +250,23 @@ export async function checkUsageApi(
   let accountName: string;
 
   if (opts.account) {
-    const store = loadAccounts(ctxRoot);
-    const acct = store?.accounts[opts.account];
-    if (!acct) throw new Error(`Account "${opts.account}" not found in accounts.json`);
-    accessToken = acct.access_token;
-    accountName = opts.account;
+    if (opts.accessToken !== undefined) {
+      // The caller pinned the exact credential to verify. rotateOAuth needs
+      // this: it uses the preflight to prove that one specific token works and
+      // then guards the commit on that same token still being on file. If this
+      // function re-read the store instead, "the preflighted credential" would
+      // be whatever a concurrent refresh happened to leave behind at the moment
+      // of THIS read — a different instant from the caller's — and the guard
+      // downstream would be comparing against a token it never verified.
+      accessToken = opts.accessToken;
+      accountName = opts.account;
+    } else {
+      const store = loadAccounts(ctxRoot);
+      const acct = store?.accounts[opts.account];
+      if (!acct) throw new Error(`Account "${opts.account}" not found in accounts.json`);
+      accessToken = acct.access_token;
+      accountName = opts.account;
+    }
   } else {
     // Fall back to env / Keychain
     const active = getActiveAccount(ctxRoot);
@@ -472,12 +484,32 @@ export async function rotateOAuth(
     // Reload after refresh (accounts.json was rewritten)
     const refreshed = loadAccounts(ctxRoot)!;
     nextAccount = refreshed.accounts[nextName];
+    if (!nextAccount) {
+      // The destination was deleted while we refreshed it. Checked here because
+      // the capture below dereferences it; without this the call dies on a
+      // TypeError instead of returning the same benign "cannot rotate" result
+      // every other vanished-destination path returns.
+      return {
+        rotated: false,
+        reason: `Account "${nextName}" disappeared from accounts.json during token refresh`,
+      };
+    }
   }
+
+  // The exact credential this rotation is about to verify, captured BEFORE the
+  // preflight await and passed into it, so that "the token that was preflighted"
+  // is defined by this line rather than inferred from a later read of a store
+  // that anyone may have rewritten in between.
+  const preflightedToken = nextAccount.access_token;
 
   // PREFLIGHT: verify next account's token works
   let preflight: CheckUsageResult;
   try {
-    preflight = await checkUsageApi(ctxRoot, { force: true, account: nextName });
+    preflight = await checkUsageApi(ctxRoot, {
+      force: true,
+      account: nextName,
+      accessToken: preflightedToken,
+    });
   } catch (err) {
     // Preflight failed — do NOT write .env files
     return {
@@ -520,6 +552,7 @@ export async function rotateOAuth(
   // is the same blind spot the store has had all along.
   let supersededBy: string | undefined;
   let raced = false;
+  let credentialMoved = false;
   const committed = withAccountsLock(ctxRoot, (reloaded) => {
     if (reloaded.active !== currentName) {
       supersededBy = reloaded.active;
@@ -531,6 +564,31 @@ export async function rotateOAuth(
     }
     const next = reloaded.accounts[nextName];
     if (!next) return false;
+    // The destination survived by NAME, but the preflight proved a token, not a
+    // name. A concurrent refresh or an admin edit can swap this account's
+    // credential inside the same await window, and then the thing that was
+    // verified and the thing about to be distributed are two different tokens.
+    // Neither predicate above sees it: `active` never moved and no rotation
+    // committed, so this is a third, independent way for the decision's premise
+    // to go stale.
+    //
+    // Abort rather than distribute the newer token: an unverified credential
+    // written to every agent .env breaks every agent at once, and not
+    // distributing an unpreflighted token is the invariant the preflight exists
+    // to enforce.
+    //
+    // The cost is NOT zero, and the tradeoff is deliberate. Anything that
+    // refreshes this account in step with the rotation cycle — a synchronized
+    // watchdog, an admin reconciler — can keep landing inside this same window
+    // and starve rotation, leaving an over-quota account active. That is a real
+    // failure mode; it is accepted here because its worst case is degraded
+    // throughput on an account that still works, while the alternative's worst
+    // case is every agent holding a credential nobody checked. A bounded retry
+    // on a fresh snapshot would relieve it without weakening the invariant.
+    if (next.access_token !== preflightedToken) {
+      credentialMoved = true;
+      return false;
+    }
     reloaded.active = nextName;
     next.five_hour_utilization = preflight.five_hour_utilization;
     next.seven_day_utilization = preflight.seven_day_utilization;
@@ -553,16 +611,26 @@ export async function rotateOAuth(
       reason = `Rotation superseded: another rotation committed while this one was preflighting `
         + `"${nextName}" and left "${currentName}" active again; this decision predates it and `
         + `is not being applied`;
+    } else if (credentialMoved) {
+      reason = `Rotation aborted: the credential for "${nextName}" changed between preflight and `
+        + `commit, so the token this rotation verified is no longer the one on file; not `
+        + `distributing an unpreflighted token`;
     } else {
       reason = `Account "${nextName}" disappeared from accounts.json before the rotation could be committed`;
     }
     return { rotated: false, reason };
   }
 
-  // PHASE 2: Write bare access token to agent .env files
-  const finalStore = loadAccounts(ctxRoot)!;
-  const newToken = finalStore.accounts[nextName].access_token;
-  writeTokenToAgents(frameworkRoot, org, newToken, opts.agent);
+  // PHASE 2: Write bare access token to agent .env files.
+  //
+  // Distribute the token the guard above just proved is both preflighted and
+  // committed — NOT a fresh read of the store. That read happened after the
+  // lock was released, so a refresh landing in the gap would push a token no
+  // one verified to every agent, re-opening on the unlocked side exactly the
+  // hole the in-lock credential check closes. It also dropped the store's
+  // reload behind a non-null assertion that would throw if accounts.json became
+  // unreadable in that same gap.
+  writeTokenToAgents(frameworkRoot, org, preflightedToken, opts.agent);
 
   return {
     rotated: true,
