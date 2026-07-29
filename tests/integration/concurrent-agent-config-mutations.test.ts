@@ -21,8 +21,22 @@
  * directory already exists, so two CLI invocations can never both reach the
  * config.json writes for the same agent. The real concurrent writer is the
  * dashboard (whose routes take this same lock). What is proven below is (a) the
- * helper genuinely excludes concurrent OS processes, and (b) the CLI call site
- * actually goes through it — which is what makes (a) apply to the CLI at all.
+ * helper serialises concurrent OS processes that contend for a LIVE holder's
+ * lock, and (b) add-agent's config.json write is excluded by that same lock.
+ *
+ * BOTH CLAIMS ARE NARROWER THAN THEY LOOK, deliberately:
+ *  - (a) says nothing about concurrent STALE-lock recovery. acquireLock steals a
+ *    dead holder's lock with rm+mkdir+write, which is not atomic, so two
+ *    processes that both find the same dead pid can both come away believing
+ *    they hold it. That is a pre-existing property of src/utils/lock.ts, not of
+ *    this change, and it is tracked separately. No arm here exercises it: every
+ *    run starts with no .lock.d and every holder is alive.
+ *  - (b) is a black-box protocol test, not a call-path test. It proves the write
+ *    respects <agentDir>/.lock.d — which is the property that actually matters,
+ *    since exclusion depends on locking the same directory, not on sharing a
+ *    function. It would also pass if add-agent called withFileLockSync directly.
+ *    It covers the create branch only: neither the runtime injection nor the
+ *    org-tuning-knobs transaction is exercised.
  *
  * SANDBOXING: children run with cwd set to a temp dir, HOME overridden
  * (os.homedir() honours $HOME on POSIX), CTX_ROOT pointed INSIDE the sandbox
@@ -71,9 +85,24 @@ const agentDir = () => join(sandbox, 'orgs', ORG, 'agents', AGENT);
 const configPath = () => join(agentDir(), 'config.json');
 const barrierDir = () => join(sandbox, 'barrier');
 const tornDir = () => join(sandbox, 'torn');
+const doneDir = () => join(sandbox, 'done');
 
 /** Torn reads observed by the children — a second, independent loss signal. */
 const tornReads = () => readdirSync(tornDir());
+
+/**
+ * How many mutations actually reached their write, counted by the children
+ * themselves rather than assumed from WRITERS*ITERATIONS.
+ *
+ * This is what keeps the two failure modes from being confused for one another.
+ * A child that hits a torn read skips that iteration entirely — no write, no
+ * counter increment — so a run with tears would leave `counter` short of
+ * WRITERS*ITERATIONS even if not one update had been lost. Comparing `counter`
+ * against the number of writes that were actually attempted makes a shortfall
+ * mean exactly one thing: a write landed and was then overwritten by a stale
+ * snapshot. That is the lost update, proven rather than inferred.
+ */
+const attemptedWrites = () => readdirSync(doneDir()).length;
 
 /**
  * Padding keys nobody mutates, present only to make the file big.
@@ -95,7 +124,7 @@ function seed(): void {
   const cfg: Record<string, any> = { agent_name: AGENT, enabled: true, counter: 0 };
   for (let i = 0; i < PADDING_ENTRIES; i++) cfg[`padding_${i}`] = 'x'.repeat(200);
   writeFileSync(configPath(), JSON.stringify(cfg, null, 2) + '\n');
-  for (const d of [barrierDir(), tornDir()]) {
+  for (const d of [barrierDir(), tornDir(), doneDir()]) {
     rmSync(d, { recursive: true, force: true });
     mkdirSync(d, { recursive: true });
   }
@@ -118,7 +147,7 @@ function seed(): void {
  *    the same read-modify-write, so the sum is exact: anything below
  *    WRITERS*ITERATIONS is a proven lost update, not an inference.
  */
-function losses(expectedCounter = WRITERS * ITERATIONS): string[] {
+function losses(expectedCounter: number): string[] {
   const raw = readFileSync(configPath(), 'utf-8');
   let cfg: Record<string, any>;
   try {
@@ -186,7 +215,7 @@ function barrier(dir, index, total) {
  */
 const UNSAFE_CHILD = `${BARRIER_SRC('cjs')}
 const { readFileSync } = require('fs');
-const [file, barrierPath, indexRaw, totalRaw, itersRaw, tornDir] = process.argv.slice(2);
+const [file, barrierPath, indexRaw, totalRaw, itersRaw, tornDir, doneDir] = process.argv.slice(2);
 const index = Number(indexRaw);
 barrier(barrierPath, index, Number(totalRaw));
 
@@ -207,6 +236,7 @@ for (let n = 0; n < Number(itersRaw); n++) {
   cfg['writer_' + index] = index;
   cfg.counter = (cfg.counter || 0) + 1;
   writeFileSync(file, JSON.stringify(cfg, null, 2) + '\\n');  // ...write. No lock.
+  writeFileSync(join(doneDir, 'done-' + index + '-' + n), '');   // this write happened
 }
 `;
 
@@ -217,7 +247,7 @@ for (let n = 0; n < Number(itersRaw); n++) {
  */
 const LOCKED_CHILD = `${BARRIER_SRC('esm')}
 import { mutateAgentConfig } from ${JSON.stringify(HELPER_MODULE)};
-const [dir, barrierPath, indexRaw, totalRaw, itersRaw, tornDir] = process.argv.slice(2);
+const [dir, barrierPath, indexRaw, totalRaw, itersRaw, tornDir, doneDir] = process.argv.slice(2);
 const index = Number(indexRaw);
 barrier(barrierPath, index, Number(totalRaw));
 
@@ -228,6 +258,7 @@ for (let n = 0; n < Number(itersRaw); n++) {
       cfg['writer_' + index] = index;
       cfg.counter = (cfg.counter || 0) + 1;
     }, { timeoutMs: 60_000 });      // generous: contention here is the point
+    writeFileSync(join(doneDir, 'done-' + index + '-' + n), '');  // this write happened
   } catch (e) {
     // Symmetric with the control child, and load-bearing for the same reason:
     // if this arm could not report a torn read, the parent's torn-read
@@ -244,7 +275,7 @@ function runWriters(interpreter: string, script: string, firstArg: string) {
     Array.from({ length: WRITERS }, (_, i) =>
       execFileAsync(
         interpreter,
-        [script, firstArg, barrierDir(), String(i), String(WRITERS), String(ITERATIONS), tornDir()],
+        [script, firstArg, barrierDir(), String(i), String(WRITERS), String(ITERATIONS), tornDir(), doneDir()],
         { cwd: sandbox, env: childEnv() },
       ),
     ),
@@ -259,14 +290,27 @@ describe('agent config.json: concurrent mutation', () => {
 
     await runWriters(process.execPath, script, configPath());
 
-    // The lost-update detector specifically, not "something went wrong": the
-    // locked arm's green rests on THIS assertion being able to fire, and torn
-    // reads alone would not exercise it.
+    const attempted = attemptedWrites();
+    expect(attempted, 'no child completed a write; nothing was exercised').toBeGreaterThan(0);
+
+    // THE LOST UPDATE, ISOLATED FROM THE TORN READ. These are two different
+    // failures of the unlocked path and it matters which one fired, because the
+    // locked arm's green rests on the lost-update detector being able to fire.
+    // A torn read makes its child skip the iteration entirely — no write, no
+    // increment — so counting against WRITERS*ITERATIONS would let tears alone
+    // satisfy this assertion and the lost-update check would never be exercised.
+    // Against writes that actually landed there is no such ambiguity: a counter
+    // below that number means a write was overwritten by a stale snapshot.
+    // (If the file is torn at rest the parse below throws, which fails this arm
+    // loudly rather than letting it pass on the wrong evidence.)
+    const cfg = JSON.parse(readFileSync(configPath(), 'utf-8'));
     expect(
-      losses(),
-      'control arm lost nothing — the detector cannot see the failure the locked ' +
-        'arm claims to rule out, so the locked arm would prove nothing',
-    ).not.toEqual([]);
+      cfg.counter,
+      'control arm lost no update — the detector cannot see the failure the ' +
+        'locked arm claims to rule out, so the locked arm would prove nothing',
+    ).toBeLessThan(attempted);
+
+    expect(losses(attempted)).not.toEqual([]);
   }, 120_000);
 
   /**
@@ -288,7 +332,8 @@ describe('agent config.json: concurrent mutation', () => {
 
     await runWriters(TSX, script, agentDir());
 
-    expect(losses(), 'no concurrent mutation may be lost under the lock').toEqual([]);
+    expect(attemptedWrites(), 'every mutation must have completed').toBe(WRITERS * ITERATIONS);
+    expect(losses(attemptedWrites()), 'no concurrent mutation may be lost under the lock').toEqual([]);
     // The control arm also observed torn reads (plain writeFileSync truncates
     // in place); the lock plus atomicWriteSync must eliminate those too.
     expect(tornReads(), 'no reader may see a partially written config.json').toEqual([]);
@@ -482,10 +527,16 @@ describe('agent config.json: lock protocol', () => {
     writeFileSync(configPath(), JSON.stringify({ agent_name: AGENT }, null, 2) + '\n');
     const before = readFileSync(configPath(), 'utf-8');
 
+    let heldDuringMutate: boolean | null = null;
     const wrote = mutateAgentConfig(agentDir(), (cfg) => {
+      // Paired with the release check below on purpose. "Lock is gone
+      // afterwards" is green against a build that never took one; only the
+      // held-then-released pair distinguishes the two.
+      heldDuringMutate = existsSync(lockDir());
       cfg.enabled = false;
       return false;
     });
+    expect(heldDuringMutate, 'the decline path must still run under the lock').toBe(true);
 
     expect(wrote).toBe(false);
     // Byte-identical matters beyond the field values: declining exists so a
