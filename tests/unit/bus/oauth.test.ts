@@ -834,6 +834,152 @@ describe('rotateOAuth — active account moved during preflight', () => {
     expect(result.reason).toContain('disappeared');
     expect(result.reason).not.toMatch(/superseded/i);
   });
+
+  /**
+   * THE ABA CASE — the one an active-compare structurally cannot see.
+   *
+   * The guard above asks "is `active` still currentName?". Two competing
+   * rotations, primary -> tertiary -> primary, answer YES while having moved
+   * the store twice. This call's decision predates both, so committing it
+   * demotes a selection that won a race it never knew it was in, and appends a
+   * primary -> secondary log entry for a transition that never happened.
+   *
+   * Note what this test does NOT rely on: `active` differs from the snapshot.
+   * It is byte-identical. Only the rotation witness can fire here, which is why
+   * this is the arm that proves the second predicate earns its place.
+   */
+  function rotationEntry(from: string, to: string, timestamp: string) {
+    return {
+      timestamp,
+      from,
+      to,
+      reason: 'competing rotation',
+      five_hour_util: 0.9,
+      seven_day_util: 0.5,
+    };
+  }
+
+  it('aborts when a rotation committed and landed active back on the same account', async () => {
+    writeStore(THREE_ACCOUNT_STORE);
+    const preflight = deferredFetch();
+    mockFetch.mockImplementationOnce(() => preflight.promise);
+
+    const call = rotateOAuth(tmpDir, '/tmp/fw', 'acme');
+
+    // Two real rotations land while our preflight is in flight. Real rotations
+    // prepend to rotation_log, which is what makes them visible at all.
+    overwriteStore((s) => {
+      s!.active = 'tertiary';
+      s!.rotation_log = [rotationEntry('primary', 'tertiary', '2026-04-05T01:00:00Z')];
+    });
+    overwriteStore((s) => {
+      s!.active = 'primary';
+      s!.rotation_log = [rotationEntry('tertiary', 'primary', '2026-04-05T02:00:00Z'), ...s!.rotation_log];
+    });
+
+    preflight.resolve(usageResponse(0.1, 0.05));
+    const result = await call;
+
+    expect(result.rotated).toBe(false);
+    expect(result.reason).toMatch(/superseded/i);
+    // Must NOT render as 'changed from "primary" to "primary"' — that reads as a
+    // broken guard rather than a caught race.
+    expect(result.reason).not.toMatch(/changed from "primary" to "primary"/);
+    expect(result.reason).toContain('active again');
+
+    const store = loadAccounts(tmpDir)!;
+    // Unguarded this is 'secondary': the decision that predates both rotations
+    // wins anyway, which is the whole bug.
+    expect(store.active).toBe('primary');
+    // Exactly the two competing entries — no fictional primary -> secondary.
+    expect(store.rotation_log).toHaveLength(2);
+    expect(store.rotation_log.map((e) => `${e.from}->${e.to}`)).toEqual([
+      'tertiary->primary',
+      'primary->tertiary',
+    ]);
+  });
+
+  /**
+   * WHY THE HEAD ENTRY AND NOT `rotation_log.length`.
+   *
+   * Length is the obvious cheap witness and it is wrong in the one state a
+   * long-lived store spends all its time in. rotation_log is sliced to
+   * ROTATION_LOG_MAX (50) on every commit, so once it is full a competing
+   * rotation prepends one entry and drops one — length before and length after
+   * are identical, and a length-compare reports "nothing happened" forever.
+   *
+   * Without this arm the code comment claiming length is unusable would be an
+   * untested assertion, and a later simplification to `.length` would keep every
+   * other test in this file green while silently reopening the ABA hole for
+   * exactly the stores that have rotated the most.
+   */
+  it('detects a competing rotation once rotation_log is full and its length stops changing', async () => {
+    const FULL_LOG = Array.from({ length: 50 }, (_, i) =>
+      rotationEntry('old', 'older', `2026-04-0${(i % 9) + 1}T00:00:00Z`));
+    writeStore({ ...THREE_ACCOUNT_STORE, rotation_log: FULL_LOG });
+
+    const preflight = deferredFetch();
+    mockFetch.mockImplementationOnce(() => preflight.promise);
+
+    const call = rotateOAuth(tmpDir, '/tmp/fw', 'acme');
+
+    // A competing primary -> tertiary -> primary, each prepending and slicing
+    // exactly as the real commit path does. Length never moves off 50.
+    overwriteStore((s) => {
+      s!.active = 'tertiary';
+      s!.rotation_log = [rotationEntry('primary', 'tertiary', '2026-04-05T01:00:00Z'), ...s!.rotation_log].slice(0, 50);
+    });
+    overwriteStore((s) => {
+      s!.active = 'primary';
+      s!.rotation_log = [rotationEntry('tertiary', 'primary', '2026-04-05T02:00:00Z'), ...s!.rotation_log].slice(0, 50);
+    });
+
+    // The premise of this arm: length is genuinely unchanged, so anything that
+    // fires below fired on the head entry and not on the count.
+    expect(loadAccounts(tmpDir)!.rotation_log).toHaveLength(FULL_LOG.length);
+
+    preflight.resolve(usageResponse(0.1, 0.05));
+    const result = await call;
+
+    expect(result.rotated).toBe(false);
+    expect(result.reason).toMatch(/superseded/i);
+    expect(loadAccounts(tmpDir)!.active).toBe('primary');
+  });
+
+  /**
+   * THE VACUITY GUARD, and it is not optional.
+   *
+   * A witness that compared anything touched by the refresh or the preflight
+   * would make EVERY rotation abort — and the ABA test above would still pass,
+   * because a guard that always aborts aborts correctly by accident. This is
+   * the arm that says the witness only fires on an actual competing rotation.
+   *
+   * A non-empty starting rotation_log is the load-bearing detail: with an empty
+   * one the witness is `null` on both sides and a broken implementation that
+   * ignored the log entirely would look identical.
+   */
+  it('still commits a normal rotation when nothing else touches the store', async () => {
+    writeStore({
+      ...THREE_ACCOUNT_STORE,
+      rotation_log: [rotationEntry('older', 'primary', '2026-04-04T00:00:00Z')],
+    });
+    const preflight = deferredFetch();
+    mockFetch.mockImplementationOnce(() => preflight.promise);
+
+    const call = rotateOAuth(tmpDir, '/tmp/fw', 'acme');
+    preflight.resolve(usageResponse(0.1, 0.05));
+    const result = await call;
+
+    expect(result.rotated, `rotation was blocked with: ${result.reason}`).toBe(true);
+
+    const store = loadAccounts(tmpDir)!;
+    expect(store.active).toBe('secondary');
+    // The new entry on top, the pre-existing one preserved beneath it.
+    expect(store.rotation_log).toHaveLength(2);
+    expect(store.rotation_log[0].from).toBe('primary');
+    expect(store.rotation_log[0].to).toBe('secondary');
+    expect(store.rotation_log[1].from).toBe('older');
+  });
 });
 
 describe('alert thresholds', () => {

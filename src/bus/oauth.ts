@@ -163,6 +163,33 @@ function withAccountsLock(
   });
 }
 
+/**
+ * A witness for "has any rotation committed since this store was read".
+ *
+ * `active` cannot answer that question. A -> B -> A inside one call's await
+ * window leaves `active` byte-identical to the snapshot while two rotations
+ * have landed, so an active-compare sees no race and a decision made before
+ * either of them commits over both — writing a rotation_log entry for a
+ * transition that never happened and pushing a superseded account's token to
+ * every agent. That is the ABA hole, and it is why the guard needs a second
+ * predicate rather than a sharper version of the first.
+ *
+ * rotation_log is the store's only append-on-every-rotation field, so its head
+ * changes exactly when a rotation commits — including the A -> B -> A case,
+ * where the head afterwards describes B -> A rather than whatever preceded it.
+ *
+ * The LENGTH is deliberately not used: the log is sliced to ROTATION_LOG_MAX,
+ * so at steady state it stops growing while rotations keep happening, and a
+ * length compare would silently stop detecting anything at exactly the point
+ * the store has seen the most rotations.
+ *
+ * Compares equal for an empty or absent log, which is correct: no rotation has
+ * ever committed, so there is nothing for a competing one to have changed yet.
+ */
+function rotationWitness(store: AccountsStore): string {
+  return JSON.stringify(store.rotation_log?.[0] ?? null);
+}
+
 export function getActiveAccount(ctxRoot: string): { name: string; account: OAuthAccount } | null {
   const store = loadAccounts(ctxRoot);
   if (!store) return null;
@@ -412,6 +439,10 @@ export async function rotateOAuth(
   const current = store.accounts[currentName];
   if (!current) return { rotated: false, reason: `Active account "${currentName}" not found` };
 
+  // Captured from the SAME read as `currentName` — the whole point is that both
+  // describe the store as it looked before the awaits below. See rotationWitness.
+  const witness = rotationWitness(store);
+
   // Check utilization thresholds (or force flag)
   const needsRotation = opts.force ||
     current.five_hour_utilization >= THRESHOLD_5H ||
@@ -478,10 +509,24 @@ export async function rotateOAuth(
   // race that had already resolved correctly would be traded for an unverified
   // token written to every agent's .env — the one invariant rotation exists to
   // protect.
+  //
+  // TWO predicates, because they detect different things and neither implies
+  // the other. `active` moving catches a competing rotation or an admin edit
+  // that left the store somewhere new. The rotation witness catches a rotation
+  // that committed and landed `active` back on `currentName` — A -> B -> A —
+  // which the first predicate reports as "no race" precisely when two rotations
+  // have happened. An admin edit that restores `active` by hand appends no log
+  // entry and is indistinguishable from no change at all; that is accepted, and
+  // is the same blind spot the store has had all along.
   let supersededBy: string | undefined;
+  let raced = false;
   const committed = withAccountsLock(ctxRoot, (reloaded) => {
     if (reloaded.active !== currentName) {
       supersededBy = reloaded.active;
+      return false;
+    }
+    if (rotationWitness(reloaded) !== witness) {
+      raced = true;
       return false;
     }
     const next = reloaded.accounts[nextName];
@@ -496,13 +541,22 @@ export async function rotateOAuth(
   if (!committed) {
     // Distinguish a lost race from a corrupted store — they need different
     // responses, and the generic message reads as data loss for a benign race.
-    return {
-      rotated: false,
-      reason: supersededBy !== undefined
-        ? `Rotation superseded: active account changed from "${currentName}" to "${supersededBy}" `
-          + `while this rotation was preflighting "${nextName}"; not overwriting the newer selection`
-        : `Account "${nextName}" disappeared from accounts.json before the rotation could be committed`,
-    };
+    // Three distinct outcomes, kept distinct. The ABA case must NOT reuse the
+    // superseded wording: it would render as active changing from "primary" to
+    // "primary", which reads as a bug in the guard rather than a description of
+    // one it caught.
+    let reason: string;
+    if (supersededBy !== undefined) {
+      reason = `Rotation superseded: active account changed from "${currentName}" to "${supersededBy}" `
+        + `while this rotation was preflighting "${nextName}"; not overwriting the newer selection`;
+    } else if (raced) {
+      reason = `Rotation superseded: another rotation committed while this one was preflighting `
+        + `"${nextName}" and left "${currentName}" active again; this decision predates it and `
+        + `is not being applied`;
+    } else {
+      reason = `Account "${nextName}" disappeared from accounts.json before the rotation could be committed`;
+    }
+    return { rotated: false, reason };
   }
 
   // PHASE 2: Write bare access token to agent .env files
