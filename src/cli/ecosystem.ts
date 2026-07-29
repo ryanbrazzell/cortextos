@@ -10,7 +10,6 @@ export const ecosystemCommand = new Command('ecosystem')
   .option('--output <path>', 'Output file', 'ecosystem.config.js')
   .description('Generate PM2 ecosystem.config.js from agent configs')
   .action(async (options: { instance: string; org?: string; output: string }) => {
-    const ctxRoot = join(homedir(), '.cortextos', options.instance);
     // BUG-035 (companion fix): same project-root discovery as enable-agent.ts
     // so `cortextos ecosystem` works from outside ~/cortextos.
     let projectRoot: string;
@@ -101,6 +100,28 @@ export const ecosystemCommand = new Command('ecosystem')
     // process is already daemonized so this is invisible. Harmless if true
     // on non-Windows (PM2 ignores the flag). Surfaces as a stray terminal
     // titled "next-server (vX.Y.Z)" after `pm2 resurrect` post-reboot.
+    // Both app blocks below resolve the instance id and CTX_ROOT through these
+    // two expressions, emitted as source so PM2 evaluates them at startup.
+    //
+    // ctxRootExpr DERIVES the root from the instance id and deliberately does
+    // not fall back to \`process.env.CTX_ROOT\`. That mirrors what the daemon
+    // already does at runtime (src/daemon/index.ts: "Always derive ctxRoot from
+    // instanceId to avoid inheriting a parent cortextOS's CTX_ROOT"), so the env
+    // PM2 hands the daemon now states the same root the daemon will pick anyway.
+    //
+    // The daemon block used to emit \`process.env.CTX_ROOT || <baked literal>\`,
+    // which broke two ways. (1) An ambient CTX_ROOT — every agent shell exports
+    // one — flowed into the daemon's env, and while the daemon core ignored it,
+    // the IPC server, cron scheduler and cron execution log all run in-process
+    // and read process.env.CTX_ROOT directly, so they served a different tree
+    // than the daemon they live in. (2) The literal froze the generation-time
+    // instance, so the \`CTX_INSTANCE_ID=foo pm2 restart\` switch advertised in
+    // the generated header moved the instance id and the --instance arg but left
+    // CTX_ROOT on the old instance. Deriving fixes both, and keeps the daemon
+    // and dashboard blocks in agreement under every combination of the two vars.
+    const instanceExpr = `process.env.CTX_INSTANCE_ID || ${JSON.stringify(options.instance)}`;
+    const ctxRootExpr = `require('path').join(require('os').homedir(), '.cortextos', ${instanceExpr})`;
+
     const dashboardAppBlock = hasDashboard
       ? `,
     {
@@ -110,8 +131,8 @@ export const ecosystemCommand = new Command('ecosystem')
       cwd: ${JSON.stringify(dashboardDir)},
       env: {
         PORT: process.env.PORT || '3000',
-        CTX_INSTANCE_ID: process.env.CTX_INSTANCE_ID || ${JSON.stringify(options.instance)},
-        CTX_ROOT: require('path').join(require('os').homedir(), '.cortextos', process.env.CTX_INSTANCE_ID || ${JSON.stringify(options.instance)}),
+        CTX_INSTANCE_ID: ${instanceExpr},
+        CTX_ROOT: ${ctxRootExpr},
         CTX_FRAMEWORK_ROOT: ${JSON.stringify(projectRoot)},
         CTX_PROJECT_ROOT: ${JSON.stringify(projectRoot)},
       },
@@ -146,16 +167,21 @@ export const ecosystemCommand = new Command('ecosystem')
 // Note: env vars use process.env.X || 'default' so PM2 picks up the value
 // from the calling shell at startup time. This means \`CTX_INSTANCE_ID=foo
 // pm2 restart cortextos-daemon\` switches instances without regenerating.
+//
+// CTX_ROOT is the exception: it is DERIVED from the instance id rather than
+// read from the calling shell, so switching CTX_INSTANCE_ID moves the state
+// root with it and a stray CTX_ROOT in the calling shell cannot point one
+// app at another instance's tree. Both apps derive it identically.
 module.exports = {
   apps: [
     {
       name: 'cortextos-daemon',
       script: ${JSON.stringify(daemonScript)},
-      args: '--instance ' + (process.env.CTX_INSTANCE_ID || ${JSON.stringify(options.instance)}),
+      args: '--instance ' + (${instanceExpr}),
       cwd: ${JSON.stringify(projectRoot)},
       env: {
-        CTX_INSTANCE_ID: process.env.CTX_INSTANCE_ID || ${JSON.stringify(options.instance)},
-        CTX_ROOT: process.env.CTX_ROOT || ${JSON.stringify(ctxRoot)},
+        CTX_INSTANCE_ID: ${instanceExpr},
+        CTX_ROOT: ${ctxRootExpr},
         CTX_FRAMEWORK_ROOT: ${JSON.stringify(projectRoot)},
         CTX_PROJECT_ROOT: ${JSON.stringify(projectRoot)},
         CTX_ORG: process.env.CTX_ORG || ${JSON.stringify(detectedOrg)},
