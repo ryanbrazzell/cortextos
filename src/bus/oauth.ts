@@ -274,10 +274,34 @@ export async function checkUsageApi(
   ctxRoot: string,
   opts: { force?: boolean; account?: string; accessToken?: string } = {},
 ): Promise<CheckUsageResult> {
-  // Check cache first (unless force)
+  // Resolve which account is being ASKED about before consulting the cache.
+  // NAME only, deliberately not the credential: resolving the token here would
+  // move the "Account not found" / "No OAuth token available" throws in front of
+  // a warm-cache hit that currently succeeds (e.g. a cached 'env' snapshot with
+  // CLAUDE_CODE_OAUTH_TOKEN since unset). Neither call below throws.
+  const targetAccount = opts.account ?? getActiveAccount(ctxRoot)?.name ?? 'env';
+
+  // Check cache first (unless force). The cache holds ONE snapshot for whichever
+  // account was checked last, and the snapshot has always carried its own
+  // `account` label — but the read side never compared it. Without this gate,
+  // `check-usage-api --account B` inside the 3-minute TTL is served account A's
+  // numbers, and rotateOAuth's preflight of a candidate account publishes
+  // numbers that are then served as the active account's until the TTL expires.
+  // A mismatch (or a legacy snapshot with no label) is treated as a MISS, which
+  // costs one API call.
+  //
+  // Scope of that guarantee, precisely: the gate keys on the NAME, so it stops a
+  // differently-LABELLED account being served. It does NOT make cache identity
+  // credential-bound. Two different credentials that share a label still collide
+  // — most plainly CLAUDE_CODE_OAUTH_TOKEN being swapped inside the 3-minute TTL
+  // (both snapshots are labelled 'env'), and an account deleted and recreated
+  // under the same name with a different token. Pre-existing and strictly
+  // narrowed, not introduced, by this change; fixing it means keying the cache
+  // on a credential fingerprint, which is a schema change and is filed
+  // separately rather than smuggled in here.
   if (!opts.force) {
     const cache = loadCache(ctxRoot);
-    if (cache && cache.expires_at > Date.now()) {
+    if (cache && cache.expires_at > Date.now() && cache.snapshot?.account === targetAccount) {
       return { ...cache.snapshot, cached: true };
     }
   }

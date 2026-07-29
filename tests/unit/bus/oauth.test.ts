@@ -364,6 +364,79 @@ describe('checkUsageApi', () => {
   });
 });
 
+describe('checkUsageApi — the cache hit is scoped to the account being asked about', () => {
+  // TWO STATES THESE TESTS MUST DISTINGUISH, named before they were written:
+  //   (a) warm cache whose snapshot.account MATCHES the query -> must be SERVED
+  //   (b) warm cache whose snapshot.account DIFFERS            -> must be a MISS
+  // Asserting only (b) would pass vacuously against a build that never serves
+  // the cache at all, so (a) is asserted alongside it and both arms warm the
+  // cache EXPLICITLY with a known account first. Utilization values differ per
+  // account so the assertions pin down WHOSE numbers came back, not merely the
+  // `cached` flag — a build that returned the wrong snapshot with cached:false
+  // would still be wrong.
+
+  // The mocked API values are PERCENTAGE POINTS (0–100), matching what the real
+  // usage API returns; `normalize` divides by 100. Feeding fractions here would
+  // under-report 100x and the arms would compare 0.0077-scale noise instead of
+  // the per-account values they exist to tell apart.
+  async function warmCacheFor(account: string, five: number, seven: number) {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: five, seven_day_utilization: seven }),
+    });
+    await checkUsageApi(tmpDir, { force: true, account });
+  }
+
+  it('serves the cache when the cached snapshot is for the SAME account', async () => {
+    writeStore();
+    await warmCacheFor('secondary', 77, 66);
+
+    const hit = await checkUsageApi(tmpDir, { account: 'secondary' });
+
+    expect(hit.cached).toBe(true);
+    expect(hit.account).toBe('secondary');
+    expect(hit.five_hour_utilization).toBe(0.77);
+    expect(mockFetch).toHaveBeenCalledOnce(); // the warm-up only
+  });
+
+  it('treats the cache as a MISS when it holds a DIFFERENT account', async () => {
+    writeStore();
+    await warmCacheFor('secondary', 77, 66);
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: 11, seven_day_utilization: 22 }),
+    });
+    const result = await checkUsageApi(tmpDir, { account: 'primary' });
+
+    // Without the scope gate this returned secondary's 0.77 with cached:true.
+    expect(result.cached).toBe(false);
+    expect(result.account).toBe('primary');
+    expect(result.five_hour_utilization).toBe(0.11);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe('Bearer tok_primary_abc');
+  });
+
+  it('treats the cache as a MISS for the ACTIVE account when the cache holds another', async () => {
+    // Covers the other resolution branch: no opts.account, so the target name
+    // comes from getActiveAccount (= 'primary'). The explicit-account arms above
+    // never exercise it, so a fix that only read opts.account would pass them.
+    writeStore();
+    await warmCacheFor('secondary', 77, 66);
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: 11, seven_day_utilization: 22 }),
+    });
+    const result = await checkUsageApi(tmpDir);
+
+    expect(result.cached).toBe(false);
+    expect(result.account).toBe('primary');
+    expect(result.five_hour_utilization).toBe(0.11);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('refreshOAuthToken', () => {
   it('throws when no accounts.json', async () => {
     await expect(refreshOAuthToken(tmpDir)).rejects.toThrow('No accounts.json');
