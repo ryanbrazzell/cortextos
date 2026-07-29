@@ -72,16 +72,22 @@ export interface Task {
 
 // Event Types
 
-export type EventCategory =
-  | 'action'
-  | 'error'
-  | 'metric'
-  | 'milestone'
-  | 'heartbeat'
-  | 'message'
-  | 'task'
-  | 'approval'
-  | 'agent_activity';
+// The single source of truth for event categories. Validators must derive their
+// accept-list from this rather than restate it: three hand-maintained copies had
+// already drifted, and the one that mattered dropped 'agent_activity'.
+export const EVENT_CATEGORIES = [
+  'action',
+  'error',
+  'metric',
+  'milestone',
+  'heartbeat',
+  'message',
+  'task',
+  'approval',
+  'agent_activity',
+] as const;
+
+export type EventCategory = (typeof EVENT_CATEGORIES)[number];
 
 export type EventSeverity = 'info' | 'warning' | 'error' | 'critical';
 

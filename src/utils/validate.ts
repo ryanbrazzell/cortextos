@@ -1,5 +1,5 @@
 import type { Priority, EventCategory, EventSeverity, ApprovalCategory } from '../types/index.js';
-import { VALID_PRIORITIES } from '../types/index.js';
+import { VALID_PRIORITIES, EVENT_CATEGORIES } from '../types/index.js';
 
 const AGENT_NAME_REGEX = /^[a-z0-9_-]+$/;
 // Task IDs are generated as `task_<epoch>_<rand>` (lowercase). Allow lowercase
@@ -48,9 +48,7 @@ export function validatePriority(priority: string): asserts priority is Priority
   }
 }
 
-const VALID_CATEGORIES: EventCategory[] = [
-  'action', 'error', 'metric', 'milestone', 'heartbeat', 'message', 'task', 'approval',
-];
+const VALID_CATEGORIES: readonly EventCategory[] = EVENT_CATEGORIES;
 
 export function validateEventCategory(category: string): asserts category is EventCategory {
   if (!VALID_CATEGORIES.includes(category as EventCategory)) {

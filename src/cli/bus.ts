@@ -25,6 +25,7 @@ import { IPCClient } from '../daemon/ipc-server.js';
 import { TelegramAPI } from '../telegram/api.js';
 import { logOutboundMessage, cacheLastSent } from '../telegram/logging.js';
 import type { Priority, Task, TaskStatus, EventCategory, EventSeverity, ApprovalCategory, ApprovalStatus, OrgContext, CronDefinition } from '../types/index.js';
+import { EVENT_CATEGORIES } from '../types/index.js';
 
 /**
  * Check if the org requires deliverables and the task has none attached.
@@ -399,7 +400,7 @@ busCommand
   .argument('<severity>', 'Severity (info, warning, error, critical)')
   .option('--meta <json>', 'Metadata JSON string', '{}')
   .action((category: string, event: string, severity: string, opts: { meta: string }) => {
-    const validCategories: EventCategory[] = ['action', 'error', 'metric', 'milestone', 'heartbeat', 'message', 'task', 'approval'];
+    const validCategories: readonly EventCategory[] = EVENT_CATEGORIES;
     if (!validCategories.includes(category as EventCategory)) {
       console.error(`Invalid category '${category}'. Must be one of: ${validCategories.join(', ')}`);
       process.exit(1);
@@ -2676,7 +2677,7 @@ busCommand
           // Log to event bus
           if (!opts.dryRun) {
             try {
-              logEvent(paths, env.agentName, env.org, 'agent_activity' as any, 'tool_call', 'info', {
+              logEvent(paths, env.agentName, env.org, 'agent_activity', 'tool_call', 'info', {
                 line: trimmed,
                 session: sessionName,
                 high_signal: isHighSignal,

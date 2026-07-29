@@ -13,6 +13,7 @@ import {
   sanitizeForPtyInjection,
   wrapFenceSafe,
 } from '../../../src/utils/validate';
+import { EVENT_CATEGORIES } from '../../../src/types/index';
 
 describe('validateInstanceId', () => {
   it('accepts valid instance IDs', () => {
@@ -95,15 +96,27 @@ describe('validatePriority', () => {
 });
 
 describe('validateEventCategory', () => {
-  it('accepts valid categories', () => {
-    const valid = ['action', 'error', 'metric', 'milestone', 'heartbeat', 'message', 'task', 'approval'];
-    for (const cat of valid) {
+  // Derived from EVENT_CATEGORIES on purpose. The previous version restated the
+  // list literally, so it stayed green while 'agent_activity' was legal in the
+  // type and rejected at runtime. A hand-copied list cannot detect drift from
+  // the thing it was copied from.
+  it('accepts every category the type advertises', () => {
+    for (const cat of EVENT_CATEGORIES) {
       expect(() => validateEventCategory(cat)).not.toThrow();
     }
   });
 
+  it('accepts agent_activity, which the tool-call stream emits', () => {
+    expect(() => validateEventCategory('agent_activity')).not.toThrow();
+  });
+
   it('rejects invalid categories', () => {
     expect(() => validateEventCategory('invalid')).toThrow();
+  });
+
+  it('covers the whole union, so a new member cannot be added untested', () => {
+    expect(EVENT_CATEGORIES).toContain('agent_activity');
+    expect(EVENT_CATEGORIES.length).toBe(9);
   });
 });
 
