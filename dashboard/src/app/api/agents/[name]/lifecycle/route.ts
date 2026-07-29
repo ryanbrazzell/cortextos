@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import { getFrameworkRoot, getCTXRoot } from '@/lib/config';
 import { IPCClient } from '@/lib/ipc-client';
+import { mutateEnabledAgents } from '@/lib/enabled-agents';
 
 export const dynamic = 'force-dynamic';
 
@@ -14,7 +15,7 @@ function isValidName(name: string): boolean {
   return /^[a-z0-9_-]+$/.test(name);
 }
 
-const VALID_ACTIONS = ['enable', 'disable', 'restart', 'start', 'stop', 'restart_continue', 'restart_fresh'];
+const VALID_ACTIONS =['enable', 'disable', 'restart', 'start', 'stop', 'restart_continue', 'restart_fresh'];
 
 // Security (C4): Validate org and name against allowlist before use in shell commands or path.join.
 function validateIdentifier(value: string | null | undefined, field: string): string {
@@ -88,22 +89,15 @@ export async function POST(
 
     switch (action) {
       case 'enable': {
-        const ctxRoot = getCTXRoot();
-        const enabledAgentsPath = path.join(ctxRoot, 'config', 'enabled-agents.json');
-        let enabledAgents: Record<string, unknown> = {};
-        try {
-          const raw = await fs.readFile(enabledAgentsPath, 'utf-8');
-          enabledAgents = JSON.parse(raw);
-        } catch { /* file may not exist yet */ }
-        enabledAgents[decoded] = {
-          ...(typeof enabledAgents[decoded] === 'object' && enabledAgents[decoded] !== null
-            ? (enabledAgents[decoded] as object)
-            : {}),
-          enabled: true,
-          ...(safeOrg ? { org: safeOrg } : {}),
-        };
-        await fs.mkdir(path.dirname(enabledAgentsPath), { recursive: true });
-        await fs.writeFile(enabledAgentsPath, JSON.stringify(enabledAgents, null, 2) + '\n', 'utf-8');
+        mutateEnabledAgents((enabledAgents) => {
+          enabledAgents[decoded] = {
+            ...(typeof enabledAgents[decoded] === 'object' && enabledAgents[decoded] !== null
+              ? (enabledAgents[decoded] as object)
+              : {}),
+            enabled: true,
+            ...(safeOrg ? { org: safeOrg } : {}),
+          };
+        });
         registryMessage = 'enabled in registry';
         ipcResult = await ipc.send({ type: 'start-agent', agent: decoded });
         break;
@@ -111,15 +105,12 @@ export async function POST(
 
       case 'disable': {
         ipcResult = await ipc.send({ type: 'stop-agent', agent: decoded });
-        const ctxRoot = getCTXRoot();
-        const enabledAgentsPath = path.join(ctxRoot, 'config', 'enabled-agents.json');
         try {
-          const raw = await fs.readFile(enabledAgentsPath, 'utf-8');
-          const enabledAgents = JSON.parse(raw) as Record<string, unknown>;
-          if (enabledAgents[decoded] && typeof enabledAgents[decoded] === 'object') {
-            (enabledAgents[decoded] as Record<string, unknown>).enabled = false;
-          }
-          await fs.writeFile(enabledAgentsPath, JSON.stringify(enabledAgents, null, 2) + '\n', 'utf-8');
+          mutateEnabledAgents((enabledAgents) => {
+            if (enabledAgents[decoded] && typeof enabledAgents[decoded] === 'object') {
+              (enabledAgents[decoded] as Record<string, unknown>).enabled = false;
+            }
+          });
           registryMessage = 'disabled in registry';
         } catch {
           registryMessage = 'registry update failed (non-fatal)';
@@ -222,14 +213,16 @@ export async function DELETE(
     }
   }
 
-  // 2. Remove from enabled-agents.json
+  // 2. Remove from enabled-agents.json.
+  //
+  // The read above (for the org lookup) is deliberately NOT reused here: an IPC
+  // round-trip has happened since, so that snapshot is stale, and writing it
+  // back would silently revert anything the CLI or another request changed in
+  // the meantime.  `mutateEnabledAgents` re-reads inside the lock.
   try {
-    delete enabledAgents[decoded];
-    await fs.writeFile(
-      enabledAgentsPath,
-      JSON.stringify(enabledAgents, null, 2) + '\n',
-      'utf-8',
-    );
+    mutateEnabledAgents((agents) => {
+      delete agents[decoded];
+    });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     console.error(`[api/agents/${decoded}/lifecycle] failed to update enabled-agents.json:`, message);
