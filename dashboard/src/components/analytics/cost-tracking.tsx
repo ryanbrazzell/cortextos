@@ -8,7 +8,8 @@ import { CHART_GOLD, MODEL_COLORS } from '@/components/charts/chart-theme';
 interface PlanUsageData {
   session: { used_pct: number; resets: string };
   week_all_models: { used_pct: number; resets: string };
-  week_sonnet: { used_pct: number };
+  /** Optional — see PlanUsage in @/lib/data/reports. Absent on OAuth snapshots. */
+  week_sonnet?: { used_pct: number };
   timestamp: string;
 }
 
@@ -88,10 +89,14 @@ export function CostTracking({
                 label="Current Session"
                 sublabel={planUsage.session.resets ? `Resets ${planUsage.session.resets}` : undefined}
               />
-              <UsageBar
-                pct={planUsage.week_sonnet.used_pct}
-                label="Weekly (Sonnet Only)"
-              />
+              {/* Absent when the OAuth writer produced the snapshot — it has no
+                  per-model breakdown. Skip the tile rather than render 0%. */}
+              {planUsage.week_sonnet && (
+                <UsageBar
+                  pct={planUsage.week_sonnet.used_pct}
+                  label="Weekly (Sonnet Only)"
+                />
+              )}
               <p className="text-[10px] text-muted-foreground">
                 Last updated: {new Date(planUsage.timestamp).toLocaleString()}
               </p>

@@ -266,7 +266,13 @@ export interface PlanUsage {
   timestamp: string;
   session: { used_pct: number; resets: string };
   week_all_models: { used_pct: number; resets: string };
-  week_sonnet: { used_pct: number };
+  /**
+   * Sonnet-only weekly usage. Optional because the OAuth writer
+   * (`src/bus/oauth.ts`) does not report a per-model breakdown — only
+   * scrape-usage does. Rendering 0 there would be a false reading, so the
+   * field is absent instead and the tile is skipped.
+   */
+  week_sonnet?: { used_pct: number };
 }
 
 export interface CodexUsage {
@@ -301,13 +307,53 @@ export function getCodexUsage(): CodexUsage | null {
   }
 }
 
+/**
+ * `state/usage/latest.json` has two writers that disagree on its schema:
+ *
+ *   1. `cortextos bus scrape-usage` (src/bus/metrics.ts) writes PlanUsage —
+ *      nested, `used_pct` on a 0–100 scale.
+ *   2. The OAuth usage refresh (src/bus/oauth.ts) writes UsageSnapshot —
+ *      FLAT, and utilization as a 0.0–1.0 FRACTION.
+ *
+ * Whichever ran last wins the file. This used to be a bare JSON.parse cast
+ * straight to PlanUsage, so when (2) was the last writer every nested field
+ * came back undefined and the analytics usage card threw on
+ * `planUsage.week_all_models.used_pct`.
+ *
+ * Detect the shape rather than assume one. Note the `* 100`: the OAuth writer
+ * stores a fraction, so a rename-only mapping would report a real 6% as
+ * 0.06% — a silent 100x UNDER-report that renders green and looks healthy.
+ */
+function asPlanUsage(parsed: unknown): PlanUsage | null {
+  if (typeof parsed !== 'object' || parsed === null) return null;
+  const raw = parsed as Record<string, unknown>;
+
+  // Shape 1: already PlanUsage (scrape-usage).
+  if (typeof raw.session === 'object' && raw.session !== null) return raw as unknown as PlanUsage;
+
+  // Shape 2: the flat OAuth UsageSnapshot.
+  if (typeof raw.five_hour_utilization === 'number' || typeof raw.seven_day_utilization === 'number') {
+    const toPct = (v: unknown): number => (typeof v === 'number' ? v * 100 : 0);
+    return {
+      agent: typeof raw.account === 'string' ? raw.account : 'claude-max',
+      timestamp: typeof raw.fetched_at === 'string' ? raw.fetched_at : '',
+      // No reset timestamps in this shape; the card already treats '' as "unknown".
+      session: { used_pct: toPct(raw.five_hour_utilization), resets: '' },
+      week_all_models: { used_pct: toPct(raw.seven_day_utilization), resets: '' },
+    };
+  }
+
+  return null;
+}
+
 export function getPlanUsage(): PlanUsage | null {
-  // Primary: an explicit `cortextos bus scrape-usage` snapshot. Preserves the
-  // manual /usage paste path and the daily JSONL history series.
+  // Primary: whatever wrote state/usage/latest.json most recently — either
+  // the scrape-usage snapshot or the OAuth usage refresh. See asPlanUsage.
   const file = path.join(CTX_ROOT, 'state', 'usage', 'latest.json');
   if (fs.existsSync(file)) {
     try {
-      return JSON.parse(fs.readFileSync(file, 'utf-8'));
+      const mapped = asPlanUsage(JSON.parse(fs.readFileSync(file, 'utf-8')));
+      if (mapped) return mapped;
     } catch {
       // fall through to the live API cache
     }
