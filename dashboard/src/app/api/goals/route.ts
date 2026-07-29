@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 import { existsSync, readFileSync } from 'fs';
-import { join } from 'path';
-import os from 'os';
+import { join, dirname } from 'path';
+import { randomBytes } from 'crypto';
 import { getGoals } from '@/lib/data/goals';
 import { getGoalsPath } from '@/lib/config';
 
@@ -107,10 +107,18 @@ export async function PATCH(request: NextRequest) {
 
   // Atomic write (tmp + rename preserves other processes' reads)
   try {
-    const { writeFileSync, renameSync } = await import('fs');
-    const tmp = join(os.tmpdir(), `goals-${org}-${Date.now()}.json`);
-    writeFileSync(tmp, JSON.stringify(current, null, 2) + '\n', 'utf-8');
-    renameSync(tmp, goalsPath);
+    const { writeFileSync, renameSync, unlinkSync } = await import('fs');
+    // The temp file MUST live in the target's own directory. rename(2) fails
+    // with EXDEV across filesystems, and the system temp dir is a separate mount
+    // whenever /tmp is tmpfs, or under Docker / systemd PrivateTmp.
+    const tmp = join(dirname(goalsPath), `.tmp.goals-${randomBytes(6).toString('hex')}`);
+    try {
+      writeFileSync(tmp, JSON.stringify(current, null, 2) + '\n', 'utf-8');
+      renameSync(tmp, goalsPath);
+    } catch (err) {
+      try { unlinkSync(tmp); } catch { /* ignore cleanup errors */ }
+      throw err;
+    }
   } catch {
     return Response.json({ error: 'Failed to write goals.json' }, { status: 500 });
   }

@@ -3,7 +3,7 @@
 
 import fs from 'fs';
 import path from 'path';
-import os from 'os';
+import { randomBytes } from 'crypto';
 import { getGoalsPath } from '@/lib/config';
 import type { GoalsFile, GoalsData } from '@/lib/types';
 
@@ -99,9 +99,17 @@ export function writeGoals(org: string, data: GoalsData): void {
     }
   }
 
-  const tmp = path.join(os.tmpdir(), `goals-${org}-${Date.now()}.json`);
-  fs.writeFileSync(tmp, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
-  fs.renameSync(tmp, filePath);
+  // The temp file MUST live in the target's own directory. rename(2) fails
+  // with EXDEV across filesystems, and the system temp dir is a separate mount
+  // whenever /tmp is tmpfs, or under Docker / systemd PrivateTmp.
+  const tmp = path.join(path.dirname(filePath), `.tmp.goals-${randomBytes(6).toString('hex')}`);
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(merged, null, 2) + '\n', 'utf-8');
+    fs.renameSync(tmp, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmp); } catch { /* ignore cleanup errors */ }
+    throw err;
+  }
 }
 
 /**
