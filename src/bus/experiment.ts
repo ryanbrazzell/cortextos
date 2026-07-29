@@ -1,6 +1,7 @@
 import { readdirSync, readFileSync, existsSync, appendFileSync, unlinkSync } from 'fs';
 import { join } from 'path';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
+import { withFileLockSync } from '../utils/lock.js';
 import { randomString } from '../utils/random.js';
 
 // --- Types ---
@@ -133,6 +134,22 @@ function saveConfig(agentDir: string, config: ExperimentConfig): void {
   const dir = join(agentDir, 'experiments');
   ensureDir(dir);
   atomicWriteSync(join(dir, 'config.json'), JSON.stringify(config, null, 2));
+}
+
+/**
+ * Lock directory guarding `<agentDir>/experiments/config.json`.
+ *
+ * `acquireLock` mkdirs `.lock.d` NON-recursively and rethrows anything that
+ * is not EEXIST, so the parent must exist before we lock — same idempotent
+ * mkdir the crons.ts precedent does (`lockDirFor`, crons.ts:57).
+ *
+ * Locking the experiments dir rather than the agent dir means cycle writers
+ * only contend with each other, not with crons.json or config.json writers.
+ */
+function cycleLockDir(agentDir: string): string {
+  const dir = join(agentDir, 'experiments');
+  ensureDir(dir);
+  return dir;
 }
 
 // --- Public API ---
@@ -446,6 +463,18 @@ export function gatherContext(
 
 /**
  * Manage experiment cycles in config.json.
+ *
+ * The three mutating actions run under the per-agent experiments lock:
+ * `atomicWriteSync` makes each individual WRITE atomic, but it does not make
+ * the surrounding read-modify-write transactional (see utils/lock.ts). Since
+ * `bdcbc01` different callers can target the same `agentDir`, so two processes
+ * can genuinely interleave the load below with a later save and lose a cycle.
+ * The load must stay INSIDE the lock — wrapping only `saveConfig` still lets
+ * a stale in-memory `config` overwrite the other process's committed write.
+ *
+ * `list` deliberately does NOT take the lock: it never writes, and
+ * `atomicWriteSync`'s rename means a reader sees either the whole pre-write
+ * file or the whole post-write one, never a partial mix.
  */
 export function manageCycle(
   agentDir: string,
@@ -463,80 +492,80 @@ export function manageCycle(
     enabled?: boolean;
   },
 ): ExperimentCycle[] {
-  const config = loadConfig(agentDir);
-  if (!config.cycles) {
-    config.cycles = [];
+  if (action === 'list') {
+    const cycles = loadConfig(agentDir).cycles ?? [];
+    // When an agent filter is supplied, return only that agent's cycles.
+    // Omitting the agent returns the full list (back-compat for callers
+    // that explicitly want a global view).
+    return options.agent ? cycles.filter((c) => c.agent === options.agent) : cycles;
   }
 
-  switch (action) {
-    case 'create': {
-      if (!options.name || !options.agent || !options.metric) {
-        throw new Error('Cycle create requires name, agent, and metric');
-      }
-      const cycle: ExperimentCycle = {
-        name: options.name,
-        agent: options.agent,
-        metric: options.metric,
-        metric_type: options.metric_type || 'qualitative',
-        surface: options.surface || '',
-        direction: options.direction || 'higher',
-        window: options.window || '24h',
-        measurement: options.measurement || '',
-        loop_interval: options.loop_interval || options.window || '24h',
-        enabled: true,
-        created_by: options.agent,
-        created_at: nowISO(),
-      };
-      config.cycles.push(cycle);
-      saveConfig(agentDir, config);
-      return config.cycles;
+  return withFileLockSync(cycleLockDir(agentDir), () => {
+    const config = loadConfig(agentDir);
+    if (!config.cycles) {
+      config.cycles = [];
     }
 
-    case 'modify': {
-      if (!options.name) {
-        throw new Error('Cycle modify requires name');
+    switch (action) {
+      case 'create': {
+        if (!options.name || !options.agent || !options.metric) {
+          throw new Error('Cycle create requires name, agent, and metric');
+        }
+        const cycle: ExperimentCycle = {
+          name: options.name,
+          agent: options.agent,
+          metric: options.metric,
+          metric_type: options.metric_type || 'qualitative',
+          surface: options.surface || '',
+          direction: options.direction || 'higher',
+          window: options.window || '24h',
+          measurement: options.measurement || '',
+          loop_interval: options.loop_interval || options.window || '24h',
+          enabled: true,
+          created_by: options.agent,
+          created_at: nowISO(),
+        };
+        config.cycles.push(cycle);
+        saveConfig(agentDir, config);
+        return config.cycles;
       }
-      const idx = config.cycles.findIndex(c => c.name === options.name);
-      if (idx === -1) {
-        throw new Error(`Cycle '${options.name}' not found`);
-      }
-      if (options.metric) config.cycles[idx].metric = options.metric;
-      if (options.metric_type) config.cycles[idx].metric_type = options.metric_type;
-      if (options.surface) config.cycles[idx].surface = options.surface;
-      if (options.direction) config.cycles[idx].direction = options.direction;
-      if (options.enabled !== undefined) config.cycles[idx].enabled = options.enabled;
-      if (options.window) config.cycles[idx].window = options.window;
-      if (options.measurement) config.cycles[idx].measurement = options.measurement;
-      if (options.loop_interval) config.cycles[idx].loop_interval = options.loop_interval;
-      if (options.agent) config.cycles[idx].agent = options.agent;
-      saveConfig(agentDir, config);
-      return config.cycles;
-    }
 
-    case 'remove': {
-      if (!options.name) {
-        throw new Error('Cycle remove requires name');
+      case 'modify': {
+        if (!options.name) {
+          throw new Error('Cycle modify requires name');
+        }
+        const idx = config.cycles.findIndex(c => c.name === options.name);
+        if (idx === -1) {
+          throw new Error(`Cycle '${options.name}' not found`);
+        }
+        if (options.metric) config.cycles[idx].metric = options.metric;
+        if (options.metric_type) config.cycles[idx].metric_type = options.metric_type;
+        if (options.surface) config.cycles[idx].surface = options.surface;
+        if (options.direction) config.cycles[idx].direction = options.direction;
+        if (options.enabled !== undefined) config.cycles[idx].enabled = options.enabled;
+        if (options.window) config.cycles[idx].window = options.window;
+        if (options.measurement) config.cycles[idx].measurement = options.measurement;
+        if (options.loop_interval) config.cycles[idx].loop_interval = options.loop_interval;
+        if (options.agent) config.cycles[idx].agent = options.agent;
+        saveConfig(agentDir, config);
+        return config.cycles;
       }
-      const removeIdx = config.cycles.findIndex(c => c.name === options.name);
-      if (removeIdx === -1) {
-        throw new Error(`Cycle '${options.name}' not found`);
-      }
-      config.cycles.splice(removeIdx, 1);
-      saveConfig(agentDir, config);
-      return config.cycles;
-    }
 
-    case 'list': {
-      // When an agent filter is supplied, return only that agent's cycles.
-      // Omitting the agent returns the full list (back-compat for callers
-      // that explicitly want a global view).
-      if (options.agent) {
-        return config.cycles.filter((c) => c.agent === options.agent);
+      case 'remove': {
+        if (!options.name) {
+          throw new Error('Cycle remove requires name');
+        }
+        const removeIdx = config.cycles.findIndex(c => c.name === options.name);
+        if (removeIdx === -1) {
+          throw new Error(`Cycle '${options.name}' not found`);
+        }
+        config.cycles.splice(removeIdx, 1);
+        saveConfig(agentDir, config);
+        return config.cycles;
       }
-      return config.cycles;
-    }
 
-    default:
-      throw new Error(`Unknown cycle action: ${action}`);
-  }
+      default:
+        throw new Error(`Unknown cycle action: ${action}`);
+    }
+  });
 }

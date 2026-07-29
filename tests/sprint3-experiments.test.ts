@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, readFileSync, writeFileSync, mkdirSync, rmSync } from 'fs';
+import { spawn } from 'child_process';
 import { join } from 'path';
 import { tmpdir } from 'os';
 import {
@@ -439,6 +440,153 @@ describe('Sprint 3: Experiment Framework', () => {
 
     it('throws when creating without required fields', () => {
       expect(() => manageCycle(testDir, 'create', { name: 'x' })).toThrow('requires');
+    });
+  });
+
+  /**
+   * These pin that the mutating actions run under the experiments-dir mutex.
+   *
+   * Scope, deliberately: an in-process test cannot prove mutual exclusion —
+   * withFileLockSync blocks synchronously, so two calls on this thread can
+   * never interleave and the lock is always uncontended. What IS proved here
+   * is the decisive new claim: manageCycle ACQUIRES the lock, and declines to
+   * write when someone else holds it. Mutual exclusion between real processes
+   * is withFileLockSync's own contract (tests/unit/utils/lock.test.ts).
+   *
+   * The holder is simulated by planting `.lock.d` with a LIVE pid — acquireLock
+   * steals the lock when the stored pid is dead, so a fake pid would make these
+   * pass for the wrong reason.
+   */
+  describe('manageCycle locking', () => {
+    const experimentsDir = () => join(testDir, 'experiments');
+    const configPath = () => join(experimentsDir(), 'config.json');
+
+    /** Simulate another process holding the lock. */
+    function plantLiveHolder(): void {
+      const lockDir = join(experimentsDir(), '.lock.d');
+      mkdirSync(lockDir, { recursive: true });
+      // Our own pid is alive, so acquireLock's stale-lock steal will not fire.
+      writeFileSync(join(lockDir, 'pid'), String(process.pid));
+    }
+
+    it('create does not write while another process holds the lock', () => {
+      plantLiveHolder();
+
+      expect(() =>
+        manageCycle(testDir, 'create', { name: 'blocked', agent: 'a', metric: 'm' }),
+      ).toThrow(/failed to acquire lock/);
+
+      // Nothing was written. NOTE: this does NOT distinguish "load inside the
+      // lock" from "only saveConfig locked" — both refuse to write here. The
+      // lost-update test below is the one that separates them.
+      expect(existsSync(configPath())).toBe(false);
+    }, 15_000);
+
+    it('modify does not clobber the file while another process holds the lock', () => {
+      manageCycle(testDir, 'create', { name: 'keep', agent: 'a', metric: 'm' });
+      const before = readFileSync(configPath(), 'utf-8');
+
+      plantLiveHolder();
+
+      expect(() =>
+        manageCycle(testDir, 'modify', { name: 'keep', metric: 'changed' }),
+      ).toThrow(/failed to acquire lock/);
+      expect(readFileSync(configPath(), 'utf-8')).toBe(before);
+    }, 15_000);
+
+    // CONTROL ARM: without this, a manageCycle that threw for any unrelated
+    // reason would make the two tests above pass green.
+    it('control: the same create succeeds when the lock is free', () => {
+      const cycles = manageCycle(testDir, 'create', {
+        name: 'unblocked',
+        agent: 'a',
+        metric: 'm',
+      });
+
+      expect(cycles.map((c) => c.name)).toEqual(['unblocked']);
+      expect(existsSync(configPath())).toBe(true);
+    });
+
+    // `list` taking no lock is a deliberate decision, not an oversight: it
+    // never writes, and atomicWriteSync's rename means a reader sees a whole
+    // file either way. Wrapping the entire function body would break this.
+    it('list still reads while another process holds the lock', () => {
+      manageCycle(testDir, 'create', { name: 'readable', agent: 'a', metric: 'm' });
+
+      plantLiveHolder();
+
+      expect(manageCycle(testDir, 'list', {}).map((c) => c.name)).toEqual(['readable']);
+    });
+
+    /**
+     * The real thing: a genuinely concurrent second PROCESS, because an
+     * in-process test can never prove locking — withFileLockSync blocks
+     * synchronously, so the lock is always uncontended on this thread.
+     *
+     * Ordering is what makes this discriminating. The child takes the lock,
+     * waits, and only THEN writes its cycle before releasing. So:
+     *   - load inside the lock (correct): the parent blocks before reading,
+     *     reads the child's write, appends -> BOTH cycles survive.
+     *   - only saveConfig locked (wrong): the parent reads the still-empty
+     *     file first, blocks on the write, and overwrites -> the child's
+     *     cycle is LOST. That is precisely the lost update this task is about.
+     */
+    it('does not lose a concurrent process\'s write (load must be inside the lock)', async () => {
+      const dir = experimentsDir();
+      mkdirSync(dir, { recursive: true });
+
+      const childSrc = `
+        const { mkdirSync, writeFileSync, rmSync } = require('fs');
+        const { join } = require('path');
+        const dir = process.argv[1];
+        const lockDir = join(dir, '.lock.d');
+        const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+        mkdirSync(lockDir);
+        writeFileSync(join(lockDir, 'pid'), String(process.pid));
+        sleep(800);
+        // Write only AFTER the parent has had time to call manageCycle.
+        writeFileSync(join(dir, 'config.json'), JSON.stringify({
+          cycles: [{ name: 'from-child', agent: 'a', metric: 'm' }],
+        }, null, 2));
+        sleep(200);
+        rmSync(lockDir, { recursive: true, force: true });
+      `;
+
+      const child = spawn(process.execPath, ['-e', childSrc, dir], { stdio: 'ignore' });
+      const exited = new Promise<void>((res) => child.on('exit', () => res()));
+
+      try {
+        // Wait until the child actually holds the lock.
+        const pidFile = join(dir, '.lock.d', 'pid');
+        for (let i = 0; i < 200 && !existsSync(pidFile); i++) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        expect(existsSync(pidFile)).toBe(true);
+        // The child has NOT written its cycle yet — that is the point.
+        expect(existsSync(configPath())).toBe(false);
+
+        const cycles = manageCycle(testDir, 'create', {
+          name: 'from-parent',
+          agent: 'a',
+          metric: 'm',
+        });
+
+        expect(cycles.map((c) => c.name)).toEqual(['from-child', 'from-parent']);
+        const onDisk = JSON.parse(readFileSync(configPath(), 'utf-8'));
+        expect(onDisk.cycles.map((c: { name: string }) => c.name)).toEqual([
+          'from-child',
+          'from-parent',
+        ]);
+      } finally {
+        await exited;
+      }
+    }, 20_000);
+
+    it('releases the lock so a later call still works', () => {
+      manageCycle(testDir, 'create', { name: 'first', agent: 'a', metric: 'm' });
+      const cycles = manageCycle(testDir, 'create', { name: 'second', agent: 'a', metric: 'm' });
+
+      expect(cycles.map((c) => c.name)).toEqual(['first', 'second']);
     });
   });
 });
