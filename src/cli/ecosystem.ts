@@ -110,9 +110,29 @@ export const ecosystemCommand = new Command('ecosystem')
       cwd: ${JSON.stringify(dashboardDir)},
       env: {
         PORT: process.env.PORT || '3000',
+        CTX_INSTANCE_ID: process.env.CTX_INSTANCE_ID || ${JSON.stringify(options.instance)},
+        CTX_ROOT: require('path').join(require('os').homedir(), '.cortextos', process.env.CTX_INSTANCE_ID || ${JSON.stringify(options.instance)}),
+        CTX_FRAMEWORK_ROOT: ${JSON.stringify(projectRoot)},
+        CTX_PROJECT_ROOT: ${JSON.stringify(projectRoot)},
       },
       // Dashboard reads its real config from dashboard/.env.local — populated
       // by /onboarding Phase 7. PM2 just supervises the dashboard process.
+      //
+      // The CTX_* vars above are NOT optional decoration. dashboard/src/lib/config.ts
+      // resolves its whole state tree from CTX_ROOT, falling back to
+      // homedir()/.cortextos/(CTX_INSTANCE_ID ?? 'default'). This block used to pass
+      // PORT and nothing else, so on any instance not literally named 'default' the
+      // dashboard read ~/.cortextos/default while the daemon ran the instance named
+      // above — a split brain reached by plain \`cortextos ecosystem --instance foo\`,
+      // with no error and every panel showing another instance's state. It looked
+      // latent only because the common instance id is 'default', which makes the
+      // fallback coincide with the right answer.
+      //
+      // CTX_ROOT is DERIVED from the instance id here, deliberately not
+      // \`process.env.CTX_ROOT || ...\`. src/daemon/index.ts does the same, for the
+      // reason its comment gives: a child instance must not inherit a parent
+      // cortextOS's CTX_ROOT. Reintroducing the inherit would re-open that hole on
+      // the one component that honours the variable.
       windowsHide: true,
       max_restarts: 50,
       restart_delay: 5000,
