@@ -107,7 +107,11 @@ export async function PATCH(request: NextRequest) {
 
   // Atomic write (tmp + rename preserves other processes' reads)
   try {
-    const { writeFileSync, renameSync, unlinkSync } = await import('fs');
+    const { writeFileSync, renameSync, unlinkSync, mkdirSync } = await import('fs');
+    // getGoalsPath falls back to a state path that may never have been created —
+    // `org` only has to match /^[a-z0-9_-]+$/, so a new org name is enough to
+    // land here. The shared writer in lib/data/goals.ts creates it too.
+    mkdirSync(dirname(goalsPath), { recursive: true });
     // The temp file MUST live in the target's own directory. rename(2) fails
     // with EXDEV across filesystems, and the system temp dir is a separate mount
     // whenever /tmp is tmpfs, or under Docker / systemd PrivateTmp.
