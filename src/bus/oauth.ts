@@ -145,12 +145,40 @@ function saveAccounts(ctxRoot: string, store: AccountsStore): void {
  * anything deferred past its return (an await, a callback) runs UNLOCKED. Do
  * network work before calling this and apply only the result in here.
  *
+ * `afterCommit` runs INSIDE the same critical section, immediately after
+ * accounts.json is saved, and only on the path where it was saved. It exists for
+ * writes that must not be observable separately from the commit — see phase 2 of
+ * rotateOAuth, where a lock released between the two leaves agents holding a
+ * token accounts.json no longer names as active. It deliberately runs after the
+ * save rather than inside `mutate`, so the durability order (accounts.json, then
+ * anything derived from it) is the same as when the two were separate.
+ *
+ * It carries the same synchronous requirement as `mutate`: an `async` afterCommit
+ * type-checks against a `void` return, then resumes its body after the lock is
+ * gone and silently reinstates the exact bug this parameter was added to remove.
+ * The thenable check below DETECTS that; it does not prevent it. By the time a
+ * Promise comes back the callback has already started, and throwing here cannot
+ * cancel its post-await continuation — that continuation still runs unlocked,
+ * and its rejection surfaces as an unhandled one rather than through this throw.
+ * The check is a loud failure at the call site instead of a silent race, and
+ * that is all it is. `mutate` has the identical trap with no check at all; it is
+ * left alone rather than widening this change to three existing call sites that
+ * are all synchronous today.
+ *
+ * If `afterCommit` throws, accounts.json has ALREADY been replaced — this
+ * function throws instead of returning true, so a caller cannot distinguish
+ * "committed, follow-up failed" from "committed nothing" by return value alone.
+ * Treat a throw as "the commit landed, the follow-up state is unknown". No
+ * current caller can reach it (writeTokenToAgents swallows every per-agent
+ * error), but the contract permits it.
+ *
  * Returns false without writing when accounts.json is missing or `mutate`
  * returns false; callers decide whether that is benign or an error.
  */
 function withAccountsLock(
   ctxRoot: string,
   mutate: (store: AccountsStore) => boolean,
+  afterCommit?: (store: AccountsStore) => void,
 ): boolean {
   const dir = oauthDir(ctxRoot);
   ensureDir(dir);
@@ -159,8 +187,44 @@ function withAccountsLock(
     if (!store) return false;
     if (!mutate(store)) return false;
     saveAccounts(ctxRoot, store);
+    if (afterCommit) {
+      const returned: unknown = afterCommit(store);
+      if (typeof (returned as { then?: unknown } | null | undefined)?.then === 'function') {
+        throw new Error(
+          'withAccountsLock: afterCommit returned a thenable. It must be synchronous — ' +
+          'its body would otherwise resume after the lock is released.',
+        );
+      }
+    }
     return true;
   });
+}
+
+/**
+ * A witness for "has any rotation committed since this store was read".
+ *
+ * `active` cannot answer that question. A -> B -> A inside one call's await
+ * window leaves `active` byte-identical to the snapshot while two rotations
+ * have landed, so an active-compare sees no race and a decision made before
+ * either of them commits over both — writing a rotation_log entry for a
+ * transition that never happened and pushing a superseded account's token to
+ * every agent. That is the ABA hole, and it is why the guard needs a second
+ * predicate rather than a sharper version of the first.
+ *
+ * rotation_log is the store's only append-on-every-rotation field, so its head
+ * changes exactly when a rotation commits — including the A -> B -> A case,
+ * where the head afterwards describes B -> A rather than whatever preceded it.
+ *
+ * The LENGTH is deliberately not used: the log is sliced to ROTATION_LOG_MAX,
+ * so at steady state it stops growing while rotations keep happening, and a
+ * length compare would silently stop detecting anything at exactly the point
+ * the store has seen the most rotations.
+ *
+ * Compares equal for an empty or absent log, which is correct: no rotation has
+ * ever committed, so there is nothing for a competing one to have changed yet.
+ */
+function rotationWitness(store: AccountsStore): string {
+  return JSON.stringify(store.rotation_log?.[0] ?? null);
 }
 
 export function getActiveAccount(ctxRoot: string): { name: string; account: OAuthAccount } | null {
@@ -208,12 +272,36 @@ function saveCache(ctxRoot: string, snapshot: UsageSnapshot): void {
  */
 export async function checkUsageApi(
   ctxRoot: string,
-  opts: { force?: boolean; account?: string } = {},
+  opts: { force?: boolean; account?: string; accessToken?: string } = {},
 ): Promise<CheckUsageResult> {
-  // Check cache first (unless force)
+  // Resolve which account is being ASKED about before consulting the cache.
+  // NAME only, deliberately not the credential: resolving the token here would
+  // move the "Account not found" / "No OAuth token available" throws in front of
+  // a warm-cache hit that currently succeeds (e.g. a cached 'env' snapshot with
+  // CLAUDE_CODE_OAUTH_TOKEN since unset). Neither call below throws.
+  const targetAccount = opts.account ?? getActiveAccount(ctxRoot)?.name ?? 'env';
+
+  // Check cache first (unless force). The cache holds ONE snapshot for whichever
+  // account was checked last, and the snapshot has always carried its own
+  // `account` label — but the read side never compared it. Without this gate,
+  // `check-usage-api --account B` inside the 3-minute TTL is served account A's
+  // numbers, and rotateOAuth's preflight of a candidate account publishes
+  // numbers that are then served as the active account's until the TTL expires.
+  // A mismatch (or a legacy snapshot with no label) is treated as a MISS, which
+  // costs one API call.
+  //
+  // Scope of that guarantee, precisely: the gate keys on the NAME, so it stops a
+  // differently-LABELLED account being served. It does NOT make cache identity
+  // credential-bound. Two different credentials that share a label still collide
+  // — most plainly CLAUDE_CODE_OAUTH_TOKEN being swapped inside the 3-minute TTL
+  // (both snapshots are labelled 'env'), and an account deleted and recreated
+  // under the same name with a different token. Pre-existing and strictly
+  // narrowed, not introduced, by this change; fixing it means keying the cache
+  // on a credential fingerprint, which is a schema change and is filed
+  // separately rather than smuggled in here.
   if (!opts.force) {
     const cache = loadCache(ctxRoot);
-    if (cache && cache.expires_at > Date.now()) {
+    if (cache && cache.expires_at > Date.now() && cache.snapshot?.account === targetAccount) {
       return { ...cache.snapshot, cached: true };
     }
   }
@@ -223,11 +311,23 @@ export async function checkUsageApi(
   let accountName: string;
 
   if (opts.account) {
-    const store = loadAccounts(ctxRoot);
-    const acct = store?.accounts[opts.account];
-    if (!acct) throw new Error(`Account "${opts.account}" not found in accounts.json`);
-    accessToken = acct.access_token;
-    accountName = opts.account;
+    if (opts.accessToken !== undefined) {
+      // The caller pinned the exact credential to verify. rotateOAuth needs
+      // this: it uses the preflight to prove that one specific token works and
+      // then guards the commit on that same token still being on file. If this
+      // function re-read the store instead, "the preflighted credential" would
+      // be whatever a concurrent refresh happened to leave behind at the moment
+      // of THIS read — a different instant from the caller's — and the guard
+      // downstream would be comparing against a token it never verified.
+      accessToken = opts.accessToken;
+      accountName = opts.account;
+    } else {
+      const store = loadAccounts(ctxRoot);
+      const acct = store?.accounts[opts.account];
+      if (!acct) throw new Error(`Account "${opts.account}" not found in accounts.json`);
+      accessToken = acct.access_token;
+      accountName = opts.account;
+    }
   } else {
     // Fall back to env / Keychain
     const active = getActiveAccount(ctxRoot);
@@ -395,9 +495,14 @@ export async function refreshOAuthToken(
 /**
  * Rotate the active OAuth account based on utilization thresholds.
  *
- * Two-phase write:
+ * Two-phase write, both phases in ONE critical section:
  *   Phase 1: accounts.json (permanent, written after refresh)
  *   Phase 2: agent .env files (conditional on preflight passing)
+ *
+ * The phases are ordered but not separable. A lock released between them lets a
+ * competing rotation commit and distribute in the gap, after which this call's
+ * phase 2 overwrites every agent .env with the token its own — now superseded —
+ * phase 1 chose.
  */
 export async function rotateOAuth(
   ctxRoot: string,
@@ -411,6 +516,10 @@ export async function rotateOAuth(
   const currentName = store.active;
   const current = store.accounts[currentName];
   if (!current) return { rotated: false, reason: `Active account "${currentName}" not found` };
+
+  // Captured from the SAME read as `currentName` — the whole point is that both
+  // describe the store as it looked before the awaits below. See rotationWitness.
+  const witness = rotationWitness(store);
 
   // Check utilization thresholds (or force flag)
   const needsRotation = opts.force ||
@@ -441,12 +550,32 @@ export async function rotateOAuth(
     // Reload after refresh (accounts.json was rewritten)
     const refreshed = loadAccounts(ctxRoot)!;
     nextAccount = refreshed.accounts[nextName];
+    if (!nextAccount) {
+      // The destination was deleted while we refreshed it. Checked here because
+      // the capture below dereferences it; without this the call dies on a
+      // TypeError instead of returning the same benign "cannot rotate" result
+      // every other vanished-destination path returns.
+      return {
+        rotated: false,
+        reason: `Account "${nextName}" disappeared from accounts.json during token refresh`,
+      };
+    }
   }
+
+  // The exact credential this rotation is about to verify, captured BEFORE the
+  // preflight await and passed into it, so that "the token that was preflighted"
+  // is defined by this line rather than inferred from a later read of a store
+  // that anyone may have rewritten in between.
+  const preflightedToken = nextAccount.access_token;
 
   // PREFLIGHT: verify next account's token works
   let preflight: CheckUsageResult;
   try {
-    preflight = await checkUsageApi(ctxRoot, { force: true, account: nextName });
+    preflight = await checkUsageApi(ctxRoot, {
+      force: true,
+      account: nextName,
+      accessToken: preflightedToken,
+    });
   } catch (err) {
     // Preflight failed — do NOT write .env files
     return {
@@ -478,37 +607,123 @@ export async function rotateOAuth(
   // race that had already resolved correctly would be traded for an unverified
   // token written to every agent's .env — the one invariant rotation exists to
   // protect.
+  //
+  // TWO predicates, because they detect different things and neither implies
+  // the other. `active` moving catches a competing rotation or an admin edit
+  // that left the store somewhere new. The rotation witness catches a rotation
+  // that committed and landed `active` back on `currentName` — A -> B -> A —
+  // which the first predicate reports as "no race" precisely when two rotations
+  // have happened. An admin edit that restores `active` by hand appends no log
+  // entry and is indistinguishable from no change at all; that is accepted, and
+  // is the same blind spot the store has had all along.
   let supersededBy: string | undefined;
+  let raced = false;
+  let credentialMoved = false;
   const committed = withAccountsLock(ctxRoot, (reloaded) => {
     if (reloaded.active !== currentName) {
       supersededBy = reloaded.active;
       return false;
     }
+    if (rotationWitness(reloaded) !== witness) {
+      raced = true;
+      return false;
+    }
     const next = reloaded.accounts[nextName];
     if (!next) return false;
+    // The destination survived by NAME, but the preflight proved a token, not a
+    // name. A concurrent refresh or an admin edit can swap this account's
+    // credential inside the same await window, and then the thing that was
+    // verified and the thing about to be distributed are two different tokens.
+    // Neither predicate above sees it: `active` never moved and no rotation
+    // committed, so this is a third, independent way for the decision's premise
+    // to go stale.
+    //
+    // Abort rather than distribute the newer token: an unverified credential
+    // written to every agent .env breaks every agent at once, and not
+    // distributing an unpreflighted token is the invariant the preflight exists
+    // to enforce.
+    //
+    // The cost is NOT zero, and the tradeoff is deliberate. Anything that
+    // refreshes this account in step with the rotation cycle — a synchronized
+    // watchdog, an admin reconciler — can keep landing inside this same window
+    // and starve rotation, leaving an over-quota account active. That is a real
+    // failure mode; it is accepted here because its worst case is degraded
+    // throughput on an account that still works, while the alternative's worst
+    // case is every agent holding a credential nobody checked. A bounded retry
+    // on a fresh snapshot would relieve it without weakening the invariant.
+    if (next.access_token !== preflightedToken) {
+      credentialMoved = true;
+      return false;
+    }
     reloaded.active = nextName;
     next.five_hour_utilization = preflight.five_hour_utilization;
     next.seven_day_utilization = preflight.seven_day_utilization;
     reloaded.rotation_log = [logEntry, ...reloaded.rotation_log].slice(0, ROTATION_LOG_MAX);
     return true;
-  });
+  },
+  // PHASE 2, inside the SAME critical section as phase 1 rather than after it.
+  //
+  // Distribute the token the guard above just proved is both preflighted and
+  // committed — NOT a fresh read of the store. That read happened after the
+  // lock was released, so a refresh landing in the gap would push a token no
+  // one verified to every agent, re-opening on the unlocked side exactly the
+  // hole the in-lock credential check closes. It also dropped the store's
+  // reload behind a non-null assertion that would throw if accounts.json became
+  // unreadable in that same gap.
+  //
+  // Holding the lock across it closes a second, independent hole. With phase 2
+  // outside, a rotation that had already committed could be descheduled here
+  // while another process ran a whole rotation — commit and distribution both —
+  // and then overwrite every agent .env with its own superseded token. The
+  // store named the winner while every agent ran the loser, and a partial
+  // interleave could strand different agents on different tokens. Serializing
+  // the two writes is what makes "the active account and the distributed token
+  // agree" a property of the file rather than of scheduling luck.
+  //
+  // Scope of that claim, precisely — it is narrower than "atomic" on its own
+  // suggests. It serializes rotation's two writes against another WRITER. It
+  // does not make them atomic to a READER: nothing that reads an agent .env
+  // takes this lock, so an agent starting up mid-distribution can still observe
+  // some .env files updated and others not. And it does not make accounts.json
+  // and the .env files agree in general — refreshOAuthToken commits a new
+  // access_token for an account without touching any .env, an `opts.agent`-scoped
+  // rotation updates one agent and leaves the rest, and writeTokenToAgents
+  // swallows per-agent write failures, so a rotation can report success having
+  // updated only some agents. All three survive this change untouched.
+  //
+  // Cost, deliberately accepted: the lock is now held across N synchronous
+  // .env writes instead of released before them. Those are microseconds against
+  // withFileLockSync's 5s acquire timeout, but the extra contention is not paid
+  // by rotation — it is paid by a concurrent refreshOAuthToken, whose persist
+  // throws on acquire timeout AFTER the network refresh has already spent the
+  // old refresh_token. Small odds, expensive failure; worth naming rather than
+  // rounding to zero.
+  () => writeTokenToAgents(frameworkRoot, org, preflightedToken, opts.agent));
 
   if (!committed) {
     // Distinguish a lost race from a corrupted store — they need different
     // responses, and the generic message reads as data loss for a benign race.
-    return {
-      rotated: false,
-      reason: supersededBy !== undefined
-        ? `Rotation superseded: active account changed from "${currentName}" to "${supersededBy}" `
-          + `while this rotation was preflighting "${nextName}"; not overwriting the newer selection`
-        : `Account "${nextName}" disappeared from accounts.json before the rotation could be committed`,
-    };
+    // Three distinct outcomes, kept distinct. The ABA case must NOT reuse the
+    // superseded wording: it would render as active changing from "primary" to
+    // "primary", which reads as a bug in the guard rather than a description of
+    // one it caught.
+    let reason: string;
+    if (supersededBy !== undefined) {
+      reason = `Rotation superseded: active account changed from "${currentName}" to "${supersededBy}" `
+        + `while this rotation was preflighting "${nextName}"; not overwriting the newer selection`;
+    } else if (raced) {
+      reason = `Rotation superseded: another rotation committed while this one was preflighting `
+        + `"${nextName}" and left "${currentName}" active again; this decision predates it and `
+        + `is not being applied`;
+    } else if (credentialMoved) {
+      reason = `Rotation aborted: the credential for "${nextName}" changed between preflight and `
+        + `commit, so the token this rotation verified is no longer the one on file; not `
+        + `distributing an unpreflighted token`;
+    } else {
+      reason = `Account "${nextName}" disappeared from accounts.json before the rotation could be committed`;
+    }
+    return { rotated: false, reason };
   }
-
-  // PHASE 2: Write bare access token to agent .env files
-  const finalStore = loadAccounts(ctxRoot)!;
-  const newToken = finalStore.accounts[nextName].access_token;
-  writeTokenToAgents(frameworkRoot, org, newToken, opts.agent);
 
   return {
     rotated: true,

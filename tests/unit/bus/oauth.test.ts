@@ -14,9 +14,26 @@ vi.stubGlobal('fetch', mockFetch);
 // `active`, so a test can attribute a lock to the specific write it cares about
 // rather than to a total count of acquisitions (which couples unrelated call
 // sites together and misreports which one regressed).
-const { lockedDirs, lockedSections } = vi.hoisted(() => ({
+// `envProbe.path`, when set, makes each locked section record what that agent
+// .env held at the moment the section STARTED and again when it ENDED. That
+// timing is the whole point: it is what distinguishes "phase 2 ran inside the
+// lock" from "phase 2 ran after it", which no end-state assertion can tell apart
+// in one process.
+//
+// Both ends are recorded, not just the exit. An exit-only probe says the token
+// was present by the time the section closed, which is also true of a write that
+// happened BEFORE the lock was ever acquired — so exit alone cannot place the
+// write inside the section. Entry-old plus exit-new brackets it.
+const { lockedDirs, lockedSections, envProbe } = vi.hoisted(() => ({
   lockedDirs: [] as string[],
-  lockedSections: [] as { dir: string; activeBefore?: string; activeAfter?: string }[],
+  lockedSections: [] as {
+    dir: string;
+    activeBefore?: string;
+    activeAfter?: string;
+    envAtSectionStart?: string;
+    envAtSectionEnd?: string;
+  }[],
+  envProbe: { path: null as string | null },
 }));
 vi.mock('../../../src/utils/lock.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../src/utils/lock.js')>();
@@ -39,9 +56,20 @@ vi.mock('../../../src/utils/lock.js', async (importOriginal) => {
       return actual.withFileLockSync(
         dir,
         () => {
+          const readEnv = (): string | undefined => {
+            if (!envProbe.path) return undefined;
+            try { return readFileSync(envProbe.path, 'utf-8'); } catch { return undefined; }
+          };
           const activeBefore = readActive();
+          const envAtSectionStart = readEnv();
           const result = fn();
-          lockedSections.push({ dir, activeBefore, activeAfter: readActive() });
+          lockedSections.push({
+            dir,
+            activeBefore,
+            activeAfter: readActive(),
+            envAtSectionStart,
+            envAtSectionEnd: readEnv(),
+          });
           return result;
         },
         opts as never,
@@ -125,6 +153,7 @@ beforeEach(() => {
   // leave a mockImplementationOnce queued by a failed test to leak forward.
   mockAtomicWrite.mockReset();
   mockAtomicWrite.mockImplementation(actualAtomic.atomicWriteSync);
+  envProbe.path = null;
 });
 
 afterEach(() => {
@@ -274,6 +303,43 @@ describe('checkUsageApi', () => {
     expect(call[1].headers['anthropic-beta']).toBe('oauth-2025-04-20');
   });
 
+  it('verifies the caller-pinned credential instead of re-reading the store', async () => {
+    // The contract rotateOAuth depends on. Tested HERE, directly, because it is
+    // not observable through rotateOAuth in a single process: nothing awaits
+    // between rotateOAuth capturing the token and this function reading the
+    // store, so the two always agree in-process and a build that ignored
+    // `accessToken` would pass every rotation test.
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: 0.1, seven_day_utilization: 0.05 }),
+    });
+
+    await checkUsageApi(tmpDir, {
+      force: true,
+      account: 'secondary',
+      accessToken: 'tok_pinned_not_in_store',
+    });
+
+    // The store holds tok_secondary_def for this account; the pin must win.
+    expect(mockFetch.mock.calls[0][1].headers.Authorization)
+      .toBe('Bearer tok_pinned_not_in_store');
+  });
+
+  it('falls back to the named account store token when no credential is pinned', async () => {
+    // The other half of the branch. Without this, pinning could swallow the
+    // ordinary path (the CLI's `bus usage --account X`) and nothing would fail.
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: 0.1, seven_day_utilization: 0.05 }),
+    });
+
+    await checkUsageApi(tmpDir, { force: true, account: 'secondary' });
+
+    expect(mockFetch.mock.calls[0][1].headers.Authorization).toBe('Bearer tok_secondary_def');
+  });
+
   it('performs the utilization write under the inter-process lock', async () => {
     // checkUsageApi awaits the usage API and then rewrites the WHOLE store, so
     // it has the same read-modify-write exposure as the refresh path. In one
@@ -295,6 +361,79 @@ describe('checkUsageApi', () => {
     await checkUsageApi(tmpDir, { force: true });
 
     expect(lockedDirs).toEqual([join(tmpDir, 'state', 'oauth')]);
+  });
+});
+
+describe('checkUsageApi — the cache hit is scoped to the account being asked about', () => {
+  // TWO STATES THESE TESTS MUST DISTINGUISH, named before they were written:
+  //   (a) warm cache whose snapshot.account MATCHES the query -> must be SERVED
+  //   (b) warm cache whose snapshot.account DIFFERS            -> must be a MISS
+  // Asserting only (b) would pass vacuously against a build that never serves
+  // the cache at all, so (a) is asserted alongside it and both arms warm the
+  // cache EXPLICITLY with a known account first. Utilization values differ per
+  // account so the assertions pin down WHOSE numbers came back, not merely the
+  // `cached` flag — a build that returned the wrong snapshot with cached:false
+  // would still be wrong.
+
+  // The mocked API values are PERCENTAGE POINTS (0–100), matching what the real
+  // usage API returns; `normalize` divides by 100. Feeding fractions here would
+  // under-report 100x and the arms would compare 0.0077-scale noise instead of
+  // the per-account values they exist to tell apart.
+  async function warmCacheFor(account: string, five: number, seven: number) {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: five, seven_day_utilization: seven }),
+    });
+    await checkUsageApi(tmpDir, { force: true, account });
+  }
+
+  it('serves the cache when the cached snapshot is for the SAME account', async () => {
+    writeStore();
+    await warmCacheFor('secondary', 77, 66);
+
+    const hit = await checkUsageApi(tmpDir, { account: 'secondary' });
+
+    expect(hit.cached).toBe(true);
+    expect(hit.account).toBe('secondary');
+    expect(hit.five_hour_utilization).toBe(0.77);
+    expect(mockFetch).toHaveBeenCalledOnce(); // the warm-up only
+  });
+
+  it('treats the cache as a MISS when it holds a DIFFERENT account', async () => {
+    writeStore();
+    await warmCacheFor('secondary', 77, 66);
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: 11, seven_day_utilization: 22 }),
+    });
+    const result = await checkUsageApi(tmpDir, { account: 'primary' });
+
+    // Without the scope gate this returned secondary's 0.77 with cached:true.
+    expect(result.cached).toBe(false);
+    expect(result.account).toBe('primary');
+    expect(result.five_hour_utilization).toBe(0.11);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe('Bearer tok_primary_abc');
+  });
+
+  it('treats the cache as a MISS for the ACTIVE account when the cache holds another', async () => {
+    // Covers the other resolution branch: no opts.account, so the target name
+    // comes from getActiveAccount (= 'primary'). The explicit-account arms above
+    // never exercise it, so a fix that only read opts.account would pass them.
+    writeStore();
+    await warmCacheFor('secondary', 77, 66);
+
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: 11, seven_day_utilization: 22 }),
+    });
+    const result = await checkUsageApi(tmpDir);
+
+    expect(result.cached).toBe(false);
+    expect(result.account).toBe('primary');
+    expect(result.five_hour_utilization).toBe(0.11);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
   });
 });
 
@@ -624,6 +763,73 @@ describe('rotateOAuth', () => {
     expect(activated).toHaveLength(1);
   });
 
+  it('distributes the token to agent .env inside the section that commits accounts.json', async () => {
+    // Phase 1 and phase 2 are only atomic if they share a critical section.
+    // In one process the END STATE is identical either way — accounts.json says
+    // secondary, the .env holds secondary's token — so no end-state assertion
+    // can tell the fix from the bug. What distinguishes them is WHEN the .env
+    // write lands: inside the lock, the section that flips active
+    // primary -> secondary has already written the .env by the time it ends;
+    // outside, that same section ends with the .env still on primary's token.
+    //
+    // That is also why this cannot be asserted by simulating a competing
+    // rotation. The interleaving that does the damage needs a second process
+    // descheduling this one between the two writes, and there is no such seam
+    // in-process. The lock is the observable stand-in for it.
+    const { mkdirSync, writeFileSync } = require('fs');
+    const fwRoot = mkdtempSync(join(tmpdir(), 'cortextos-fw-'));
+    const agentDir = join(fwRoot, 'orgs', 'acme', 'agents', 'rally-builder');
+    const envPath = join(agentDir, '.env');
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(envPath, 'CLAUDE_CODE_OAUTH_TOKEN=tok_primary_abc\n');
+
+    try {
+      writeStore({
+        ...SAMPLE_STORE,
+        accounts: {
+          ...SAMPLE_STORE.accounts,
+          primary: { ...SAMPLE_STORE.accounts.primary, five_hour_utilization: 0.90 },
+        },
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ five_hour_utilization: 0.1, seven_day_utilization: 0.05 }),
+      });
+
+      envProbe.path = envPath;
+      lockedSections.length = 0;
+      const result = await rotateOAuth(tmpDir, fwRoot, 'acme');
+      expect(result.rotated, `rotation was blocked with: ${result.reason}`).toBe(true);
+
+      const oauthStateDir = join(tmpDir, 'state', 'oauth');
+      const committing = lockedSections.filter(
+        (s) => s.dir === oauthStateDir
+          && s.activeBefore === 'primary'
+          && s.activeAfter === 'secondary',
+      );
+      // Deliberately ONE assertion over the whole bracket. Splitting it into a
+      // length check followed by content checks would put the length claim
+      // first, and an arm that dies there reports "wrong number of sections"
+      // for what is actually an unlocked .env write — a different defect than
+      // the one in this arm's name.
+      //
+      // The start value is asserted too, not just the end: end-alone is equally
+      // satisfied by a write that landed before the lock was taken, so it would
+      // pass on an implementation that never held the lock for phase 2 at all.
+      expect(
+        committing.map((s) => ({
+          start: s.envAtSectionStart ?? '<no .env>',
+          end: s.envAtSectionEnd ?? '<no .env>',
+        })),
+      ).toEqual([{
+        start: expect.stringContaining('tok_primary_abc'),
+        end: expect.stringContaining('tok_secondary_def'),
+      }]);
+    } finally {
+      rmSync(fwRoot, { recursive: true, force: true });
+    }
+  });
+
   it('rotates when 5h utilization exceeds threshold', async () => {
     const highUtilStore = {
       ...SAMPLE_STORE,
@@ -833,6 +1039,256 @@ describe('rotateOAuth — active account moved during preflight', () => {
     expect(result.rotated).toBe(false);
     expect(result.reason).toContain('disappeared');
     expect(result.reason).not.toMatch(/superseded/i);
+  });
+
+  /**
+   * THE ABA CASE — the one an active-compare structurally cannot see.
+   *
+   * The guard above asks "is `active` still currentName?". Two competing
+   * rotations, primary -> tertiary -> primary, answer YES while having moved
+   * the store twice. This call's decision predates both, so committing it
+   * demotes a selection that won a race it never knew it was in, and appends a
+   * primary -> secondary log entry for a transition that never happened.
+   *
+   * Note what this test does NOT rely on: `active` differs from the snapshot.
+   * It is byte-identical. Only the rotation witness can fire here, which is why
+   * this is the arm that proves the second predicate earns its place.
+   */
+  function rotationEntry(from: string, to: string, timestamp: string) {
+    return {
+      timestamp,
+      from,
+      to,
+      reason: 'competing rotation',
+      five_hour_util: 0.9,
+      seven_day_util: 0.5,
+    };
+  }
+
+  it('aborts when a rotation committed and landed active back on the same account', async () => {
+    writeStore(THREE_ACCOUNT_STORE);
+    const preflight = deferredFetch();
+    mockFetch.mockImplementationOnce(() => preflight.promise);
+
+    const call = rotateOAuth(tmpDir, '/tmp/fw', 'acme');
+
+    // Two real rotations land while our preflight is in flight. Real rotations
+    // prepend to rotation_log, which is what makes them visible at all.
+    overwriteStore((s) => {
+      s!.active = 'tertiary';
+      s!.rotation_log = [rotationEntry('primary', 'tertiary', '2026-04-05T01:00:00Z')];
+    });
+    overwriteStore((s) => {
+      s!.active = 'primary';
+      s!.rotation_log = [rotationEntry('tertiary', 'primary', '2026-04-05T02:00:00Z'), ...s!.rotation_log];
+    });
+
+    preflight.resolve(usageResponse(0.1, 0.05));
+    const result = await call;
+
+    expect(result.rotated).toBe(false);
+    expect(result.reason).toMatch(/superseded/i);
+    // Must NOT render as 'changed from "primary" to "primary"' — that reads as a
+    // broken guard rather than a caught race.
+    expect(result.reason).not.toMatch(/changed from "primary" to "primary"/);
+    expect(result.reason).toContain('active again');
+
+    const store = loadAccounts(tmpDir)!;
+    // Unguarded this is 'secondary': the decision that predates both rotations
+    // wins anyway, which is the whole bug.
+    expect(store.active).toBe('primary');
+    // Exactly the two competing entries — no fictional primary -> secondary.
+    expect(store.rotation_log).toHaveLength(2);
+    expect(store.rotation_log.map((e) => `${e.from}->${e.to}`)).toEqual([
+      'tertiary->primary',
+      'primary->tertiary',
+    ]);
+  });
+
+  /**
+   * WHY THE HEAD ENTRY AND NOT `rotation_log.length`.
+   *
+   * Length is the obvious cheap witness and it is wrong in the one state a
+   * long-lived store spends all its time in. rotation_log is sliced to
+   * ROTATION_LOG_MAX (50) on every commit, so once it is full a competing
+   * rotation prepends one entry and drops one — length before and length after
+   * are identical, and a length-compare reports "nothing happened" forever.
+   *
+   * Without this arm the code comment claiming length is unusable would be an
+   * untested assertion, and a later simplification to `.length` would keep every
+   * other test in this file green while silently reopening the ABA hole for
+   * exactly the stores that have rotated the most.
+   */
+  it('detects a competing rotation once rotation_log is full and its length stops changing', async () => {
+    const FULL_LOG = Array.from({ length: 50 }, (_, i) =>
+      rotationEntry('old', 'older', `2026-04-0${(i % 9) + 1}T00:00:00Z`));
+    writeStore({ ...THREE_ACCOUNT_STORE, rotation_log: FULL_LOG });
+
+    const preflight = deferredFetch();
+    mockFetch.mockImplementationOnce(() => preflight.promise);
+
+    const call = rotateOAuth(tmpDir, '/tmp/fw', 'acme');
+
+    // A competing primary -> tertiary -> primary, each prepending and slicing
+    // exactly as the real commit path does. Length never moves off 50.
+    overwriteStore((s) => {
+      s!.active = 'tertiary';
+      s!.rotation_log = [rotationEntry('primary', 'tertiary', '2026-04-05T01:00:00Z'), ...s!.rotation_log].slice(0, 50);
+    });
+    overwriteStore((s) => {
+      s!.active = 'primary';
+      s!.rotation_log = [rotationEntry('tertiary', 'primary', '2026-04-05T02:00:00Z'), ...s!.rotation_log].slice(0, 50);
+    });
+
+    // The premise of this arm: length is genuinely unchanged, so anything that
+    // fires below fired on the head entry and not on the count.
+    expect(loadAccounts(tmpDir)!.rotation_log).toHaveLength(FULL_LOG.length);
+
+    preflight.resolve(usageResponse(0.1, 0.05));
+    const result = await call;
+
+    expect(result.rotated).toBe(false);
+    expect(result.reason).toMatch(/superseded/i);
+    expect(loadAccounts(tmpDir)!.active).toBe('primary');
+  });
+
+  /**
+   * THE VACUITY GUARD, and it is not optional.
+   *
+   * A witness that compared anything touched by the refresh or the preflight
+   * would make EVERY rotation abort — and the ABA test above would still pass,
+   * because a guard that always aborts aborts correctly by accident. This is
+   * the arm that says the witness only fires on an actual competing rotation.
+   *
+   * A non-empty starting rotation_log is the load-bearing detail: with an empty
+   * one the witness is `null` on both sides and a broken implementation that
+   * ignored the log entirely would look identical.
+   */
+  it('still commits a normal rotation when nothing else touches the store', async () => {
+    writeStore({
+      ...THREE_ACCOUNT_STORE,
+      rotation_log: [rotationEntry('older', 'primary', '2026-04-04T00:00:00Z')],
+    });
+    const preflight = deferredFetch();
+    mockFetch.mockImplementationOnce(() => preflight.promise);
+
+    const call = rotateOAuth(tmpDir, '/tmp/fw', 'acme');
+    preflight.resolve(usageResponse(0.1, 0.05));
+    const result = await call;
+
+    expect(result.rotated, `rotation was blocked with: ${result.reason}`).toBe(true);
+
+    const store = loadAccounts(tmpDir)!;
+    expect(store.active).toBe('secondary');
+    // The new entry on top, the pre-existing one preserved beneath it.
+    expect(store.rotation_log).toHaveLength(2);
+    expect(store.rotation_log[0].from).toBe('primary');
+    expect(store.rotation_log[0].to).toBe('secondary');
+    expect(store.rotation_log[1].from).toBe('older');
+  });
+
+  /*
+   * The preflight proves a TOKEN works. Every guard above compares NAMES —
+   * `active`, and the destination still existing under `nextName`. A concurrent
+   * refresh (or an admin edit) that swaps the destination's credential inside
+   * the preflight window moves neither name, so both existing predicates report
+   * "no race" while the thing that was verified and the thing about to be
+   * distributed have become two different tokens.
+   */
+  it('aborts when the destination credential is swapped between preflight and commit', async () => {
+    writeStore(THREE_ACCOUNT_STORE);
+    const preflight = deferredFetch();
+    mockFetch.mockImplementationOnce(() => preflight.promise);
+
+    const call = rotateOAuth(tmpDir, '/tmp/fw', 'acme');
+
+    // active stays 'primary' and no rotation commits — the ONLY thing that
+    // changes is secondary's access_token, so this arm can only be caught by a
+    // predicate that compares the credential itself.
+    overwriteStore((s) => { s!.accounts.secondary.access_token = 'tok_secondary_REFRESHED'; });
+
+    preflight.resolve(usageResponse(0.1, 0.05));
+    const result = await call;
+
+    expect(result.rotated).toBe(false);
+    expect(result.reason).toMatch(/credential/i);
+    // Distinct from the two superseded messages: nothing superseded this
+    // rotation, the destination moved underneath it.
+    expect(result.reason).not.toMatch(/superseded/i);
+
+    const store = loadAccounts(tmpDir)!;
+    expect(store.active).toBe('primary');
+    expect(store.rotation_log).toHaveLength(0);
+  });
+
+  it('leaves agent .env files untouched when the destination credential moved', async () => {
+    // The user-visible harm, and the reason aborting beats taking the newer
+    // token: phase 2 writes to EVERY agent .env at once, so a rotation that ran
+    // on a stale premise disturbs the whole org simultaneously.
+    //
+    // Named for what it actually detects. It pins that phase 2 does not RUN,
+    // not that an unpreflighted token is filtered out — with phase 2 bound to
+    // `preflightedToken`, deleting only the in-lock credential check still
+    // distributes the preflighted token, so this arm goes red on the .env
+    // having been rewritten at all.
+    const { mkdirSync, writeFileSync } = require('fs');
+    const fwRoot = mkdtempSync(join(tmpdir(), 'cortextos-fw-'));
+    const envPath = join(fwRoot, 'orgs', 'acme', 'agents', 'rally-builder', '.env');
+    mkdirSync(join(fwRoot, 'orgs', 'acme', 'agents', 'rally-builder'), { recursive: true });
+    writeFileSync(envPath, 'CLAUDE_CODE_OAUTH_TOKEN=tok_primary_abc\n');
+
+    try {
+      writeStore(THREE_ACCOUNT_STORE);
+      const preflight = deferredFetch();
+      mockFetch.mockImplementationOnce(() => preflight.promise);
+
+      const call = rotateOAuth(tmpDir, fwRoot, 'acme');
+      overwriteStore((s) => { s!.accounts.secondary.access_token = 'tok_secondary_REFRESHED'; });
+      preflight.resolve(usageResponse(0.1, 0.05));
+
+      const result = await call;
+      // The .env content is asserted FIRST and deliberately: a `rotated` check
+      // ahead of it throws before these ever run, which makes this arm a
+      // duplicate of the one above and leaves the claim in its name untested.
+      const env = readFileSync(envPath, 'utf-8');
+      // Unguarded, phase 2 reads the store fresh and ships the swapped-in token.
+      expect(env).not.toContain('tok_secondary_REFRESHED');
+      expect(env).toContain('tok_primary_abc');
+      expect(result.rotated).toBe(false);
+    } finally {
+      rmSync(fwRoot, { recursive: true, force: true });
+    }
+  });
+
+  /*
+   * Vacuity arm. A credential predicate that never matched would abort every
+   * rotation, and both arms above would still pass — "it aborted" is the
+   * expected result there. This is the arm that fails if the guard fires on a
+   * store nobody touched, and it also pins that the committed rotation actually
+   * distributes the preflighted token rather than nothing at all.
+   */
+  it('still commits and distributes the preflighted token when the credential is untouched', async () => {
+    const { mkdirSync, writeFileSync } = require('fs');
+    const fwRoot = mkdtempSync(join(tmpdir(), 'cortextos-fw-'));
+    const envPath = join(fwRoot, 'orgs', 'acme', 'agents', 'rally-builder', '.env');
+    mkdirSync(join(fwRoot, 'orgs', 'acme', 'agents', 'rally-builder'), { recursive: true });
+    writeFileSync(envPath, 'CLAUDE_CODE_OAUTH_TOKEN=tok_primary_abc\n');
+
+    try {
+      writeStore(THREE_ACCOUNT_STORE);
+      const preflight = deferredFetch();
+      mockFetch.mockImplementationOnce(() => preflight.promise);
+
+      const call = rotateOAuth(tmpDir, fwRoot, 'acme');
+      preflight.resolve(usageResponse(0.1, 0.05));
+      const result = await call;
+
+      expect(result.rotated, `rotation was blocked with: ${result.reason}`).toBe(true);
+      expect(loadAccounts(tmpDir)!.active).toBe('secondary');
+      expect(readFileSync(envPath, 'utf-8')).toContain('tok_secondary_def');
+    } finally {
+      rmSync(fwRoot, { recursive: true, force: true });
+    }
   });
 });
 
