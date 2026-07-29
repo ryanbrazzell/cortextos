@@ -437,6 +437,187 @@ describe('checkUsageApi — the cache hit is scoped to the account being asked a
   });
 });
 
+describe('checkUsageApi — the cache hit is scoped to the CREDENTIAL, not just the label', () => {
+  // TWO STATES THESE TESTS MUST DISTINGUISH, named before they were written:
+  //   (a) warm entry for label L with credential X, queried as L with X -> SERVED
+  //   (b) warm entry for label L with credential X, queried as L with Y -> MISS
+  //
+  // THE LABEL IS HELD FIXED IN EVERY ARM. That is the whole point: an arm that
+  // varied the label would re-test the NAME gate (covered in the describe above)
+  // and would pass identically on a build with no fingerprint at all. Every
+  // `account:` below is 'primary', or 'env' in the env arms.
+  //
+  // (a) is asserted alongside (b) because (b) alone passes vacuously against a
+  // build that never serves the cache — a permanently-missing cache satisfies
+  // every MISS assertion in this file. Utilization values differ between the warm
+  // fixture and the follow-up fetch so the assertions pin down WHICH numbers came
+  // back rather than only the `cached` flag.
+  //
+  // Mocked API values are PERCENTAGE POINTS (0-100), matching the real usage API;
+  // `normalize` divides by 100.
+
+  const usageDirPath = () => join(tmpDir, 'state', 'usage');
+  const cacheFilePath = () => join(usageDirPath(), 'cache.json');
+  const readCache = () => JSON.parse(require('fs').readFileSync(cacheFilePath(), 'utf-8'));
+
+  function nextFetch(five: number, seven: number) {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour_utilization: five, seven_day_utilization: seven }),
+    });
+  }
+
+  // Warm the cache for a FIXED label while pinning the exact credential.
+  async function warmWithCredential(account: string, accessToken: string, five: number, seven: number) {
+    nextFetch(five, seven);
+    await checkUsageApi(tmpDir, { force: true, account, accessToken });
+  }
+
+  let savedEnvToken: string | undefined;
+  beforeEach(() => {
+    savedEnvToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  });
+  afterEach(() => {
+    if (savedEnvToken === undefined) delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    else process.env.CLAUDE_CODE_OAUTH_TOKEN = savedEnvToken;
+  });
+
+  it('serves the cache when the SAME credential is queried under the same label', async () => {
+    writeStore();
+    await warmWithCredential('primary', 'tok_X', 77, 66);
+
+    const hit = await checkUsageApi(tmpDir, { account: 'primary', accessToken: 'tok_X' });
+
+    expect(hit.cached).toBe(true);
+    expect(hit.account).toBe('primary');
+    expect(hit.five_hour_utilization).toBe(0.77);
+    expect(mockFetch).toHaveBeenCalledOnce(); // the warm-up only
+  });
+
+  it('treats the cache as a MISS when a DIFFERENT credential is queried under the SAME label', async () => {
+    writeStore();
+    await warmWithCredential('primary', 'tok_X', 77, 66);
+
+    nextFetch(11, 22);
+    const result = await checkUsageApi(tmpDir, { account: 'primary', accessToken: 'tok_Y' });
+
+    // Name gate alone cannot see this: both entries are labelled 'primary'.
+    expect(result.cached).toBe(false);
+    expect(result.account).toBe('primary');
+    expect(result.five_hour_utilization).toBe(0.11);
+    expect(mockFetch).toHaveBeenCalledTimes(2);
+    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe('Bearer tok_Y');
+  });
+
+  it('treats the cache as a MISS after a refresh replaces the token in accounts.json', async () => {
+    // The REACHABLE production case, and the reason this is not a theoretical
+    // fix: refreshOAuthToken rewrites access_token in place under the same name,
+    // so inside the 3-minute TTL the label still matches while the numbers
+    // describe the superseded credential. Resolution goes through the store here
+    // rather than an accessToken pin, so it also covers that branch.
+    writeStore();
+    nextFetch(77, 66);
+    await checkUsageApi(tmpDir, { force: true, account: 'primary' });
+
+    const refreshed = JSON.parse(JSON.stringify(SAMPLE_STORE));
+    refreshed.accounts.primary.access_token = 'tok_primary_REFRESHED';
+    writeStore(refreshed);
+
+    nextFetch(11, 22);
+    const result = await checkUsageApi(tmpDir, { account: 'primary' });
+
+    expect(result.cached).toBe(false);
+    expect(result.five_hour_utilization).toBe(0.11);
+    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe('Bearer tok_primary_REFRESHED');
+  });
+
+  it('treats the cache as a MISS when CLAUDE_CODE_OAUTH_TOKEN is swapped (both labelled env)', async () => {
+    // No accounts.json, so both snapshots carry the label 'env' and the name gate
+    // is blind by construction. This exact case was documented as unfixed.
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'env_tok_A';
+    nextFetch(77, 66);
+    const first = await checkUsageApi(tmpDir, { force: true });
+    expect(first.account).toBe('env');
+
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'env_tok_B';
+    nextFetch(11, 22);
+    const result = await checkUsageApi(tmpDir);
+
+    expect(result.cached).toBe(false);
+    expect(result.five_hour_utilization).toBe(0.11);
+    expect(mockFetch.mock.calls[1][1].headers.Authorization).toBe('Bearer env_tok_B');
+  });
+
+  it('treats a legacy entry with no fingerprint as a MISS', async () => {
+    // Entries written before this field existed have a valid label and a live
+    // expiry. Serving them would silently reintroduce exactly the collision the
+    // fingerprint closes, for the whole TTL after an upgrade.
+    writeStore();
+    const { mkdirSync, writeFileSync } = require('fs');
+    mkdirSync(usageDirPath(), { recursive: true });
+    writeFileSync(cacheFilePath(), JSON.stringify({
+      snapshot: {
+        account: 'primary',
+        five_hour_utilization: 0.77,
+        seven_day_utilization: 0.66,
+        fetched_at: '2026-07-29T00:00:00Z',
+      },
+      expires_at: Date.now() + 60_000,
+      // no credential_fp
+    }));
+
+    nextFetch(11, 22);
+    const result = await checkUsageApi(tmpDir, { account: 'primary' });
+
+    expect(result.cached).toBe(false);
+    expect(result.five_hour_utilization).toBe(0.11);
+  });
+
+  it('still serves on the label alone when no credential can be resolved', async () => {
+    // Guards a DELIBERATE decision, not an accident: with no credential in hand
+    // there is no fetch available either, so refusing the cache here would turn a
+    // usable cached answer into a thrown error. Tightening credentialMatches to
+    // return false for an unresolved credential would break this and nothing
+    // else, which is why the arm exists.
+    process.env.CLAUDE_CODE_OAUTH_TOKEN = 'env_tok_A';
+    nextFetch(77, 66);
+    await checkUsageApi(tmpDir, { force: true });
+
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN;
+    const hit = await checkUsageApi(tmpDir);
+
+    expect(hit.cached).toBe(true);
+    expect(hit.five_hour_utilization).toBe(0.77);
+    expect(mockFetch).toHaveBeenCalledOnce();
+  });
+
+  it('never writes the raw token, and keeps the fingerprint out of latest.json', async () => {
+    // Two separate contracts. (1) The fingerprint must be non-reversible — the
+    // cache is a plain file on disk. (2) latest.json and the daily JSONL are read
+    // by the dashboard and by `check-usage-api --json`; the fingerprint is cache
+    // metadata and must not leak into either, which is why it lives on the cache
+    // envelope rather than on UsageSnapshot.
+    const { readFileSync } = require('fs');
+    writeStore();
+    await warmWithCredential('primary', 'tok_SECRET_VALUE', 77, 66);
+
+    const cacheRaw = readFileSync(cacheFilePath(), 'utf-8');
+    const latestRaw = readFileSync(join(usageDirPath(), 'latest.json'), 'utf-8');
+
+    expect(cacheRaw).not.toContain('tok_SECRET_VALUE');
+    expect(latestRaw).not.toContain('tok_SECRET_VALUE');
+
+    const fp = readCache().credential_fp;
+    expect(typeof fp).toBe('string');
+    expect(fp).not.toContain('tok_SECRET_VALUE');
+
+    expect(JSON.parse(latestRaw).credential_fp).toBeUndefined();
+    expect(Object.keys(JSON.parse(latestRaw)).sort()).toEqual([
+      'account', 'fetched_at', 'five_hour_utilization', 'seven_day_utilization',
+    ]);
+  });
+});
+
 describe('refreshOAuthToken', () => {
   it('throws when no accounts.json', async () => {
     await expect(refreshOAuthToken(tmpDir)).rejects.toThrow('No accounts.json');

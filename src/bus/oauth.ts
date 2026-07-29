@@ -13,6 +13,7 @@
  */
 
 import { existsSync, readFileSync, chmodSync } from 'fs';
+import { createHash } from 'crypto';
 import { join } from 'path';
 import { homedir } from 'os';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
@@ -55,6 +56,22 @@ export interface UsageSnapshot {
 export interface UsageCache {
   snapshot: UsageSnapshot;
   expires_at: number; // Unix ms
+  /**
+   * Non-reversible fingerprint of the credential whose usage this entry holds.
+   *
+   * Deliberately on the CACHE ENVELOPE and not on `UsageSnapshot`. The snapshot
+   * is a published measurement — `saveCache` writes it verbatim to latest.json
+   * and appends it to the daily JSONL, and `checkUsageApi` spreads it into its
+   * return value, which `check-usage-api --json` prints. The fingerprint is
+   * cache-entry metadata that only the read gate below consumes, so keeping it
+   * here leaves all three of those contracts byte-identical. cache.json is read
+   * by `loadCache` and nothing else in the repo, so this field's blast radius
+   * is this file.
+   *
+   * Optional because entries written before this field existed do not carry it;
+   * see `credentialMatches` for why absence is a MISS rather than a match.
+   */
+  credential_fp?: string;
 }
 
 export interface CheckUsageResult {
@@ -248,11 +265,39 @@ function loadCache(ctxRoot: string): UsageCache | null {
   }
 }
 
-function saveCache(ctxRoot: string, snapshot: UsageSnapshot): void {
+/**
+ * A stable, non-reversible identifier for an access token.
+ *
+ * NEVER store or log the raw token. sha256 truncated to 16 hex chars (64 bits):
+ * ample to make an accidental collision between two real credentials
+ * unreachable, while leaving nothing to invert — access tokens are
+ * high-entropy, so there is no guessable preimage space even before the
+ * truncation discards most of the digest.
+ *
+ * The domain-separation prefix means this digest cannot be compared against a
+ * bare sha256 of the same token computed somewhere else, so the value is inert
+ * outside this cache.
+ */
+function credentialFingerprint(accessToken: string): string {
+  return createHash('sha256')
+    .update(`cortextos-usage-cache-v1\n${accessToken}`)
+    .digest('hex')
+    .slice(0, 16);
+}
+
+/**
+ * `credentialFp` is REQUIRED, not optional, on purpose. An entry written without
+ * one can never satisfy the read gate, so a caller that forgot it would turn the
+ * cache into a permanent miss — and the thing this cache exists to prevent is
+ * exceeding the usage API's ~5-requests-per-token limit. A silent perpetual
+ * bypass is a worse failure than a type error.
+ */
+function saveCache(ctxRoot: string, snapshot: UsageSnapshot, credentialFp: string): void {
   ensureDir(usageDir(ctxRoot));
   const cache: UsageCache = {
     snapshot,
     expires_at: Date.now() + CACHE_TTL_MS,
+    credential_fp: credentialFp,
   };
   atomicWriteSync(usageCachePath(ctxRoot), JSON.stringify(cache, null, 2));
   atomicWriteSync(usageLatestPath(ctxRoot), JSON.stringify(snapshot, null, 2));
@@ -266,50 +311,32 @@ function saveCache(ctxRoot: string, snapshot: UsageSnapshot): void {
 
 // --- check-usage-api ---
 
+type UsageCredential =
+  | { ok: true; accountName: string; accessToken: string }
+  | { ok: false; accountName: string; error: Error };
+
 /**
- * Fetch utilization from Anthropic usage API for the active account.
- * Respects 3-minute TTL cache to avoid hitting rate limits.
+ * Resolve BOTH the account name and its credential for a usage query, WITHOUT
+ * throwing.
+ *
+ * One resolver, deliberately. The cache gate needs the credential in order to
+ * compare fingerprints, and the fetch path needs it too — but the gate runs
+ * first and resolution can fail, and a failure must not preempt a warm-cache
+ * hit that would otherwise have succeeded (a cached 'env' entry read after
+ * CLAUDE_CODE_OAUTH_TOKEN was unset is the concrete case). Previously the name
+ * was derived at the top of `checkUsageApi` and the credential thirty lines
+ * below it, which kept the throws late but left two independent derivations of
+ * "which account is this" free to drift apart. Returning the error instead of
+ * throwing it lets a single derivation sit in front of the gate while the throw
+ * still lands after it.
+ *
+ * `accountName` is populated on the failure paths too, because the gate keys on
+ * it even when no credential could be resolved.
  */
-export async function checkUsageApi(
+function resolveUsageCredential(
   ctxRoot: string,
-  opts: { force?: boolean; account?: string; accessToken?: string } = {},
-): Promise<CheckUsageResult> {
-  // Resolve which account is being ASKED about before consulting the cache.
-  // NAME only, deliberately not the credential: resolving the token here would
-  // move the "Account not found" / "No OAuth token available" throws in front of
-  // a warm-cache hit that currently succeeds (e.g. a cached 'env' snapshot with
-  // CLAUDE_CODE_OAUTH_TOKEN since unset). Neither call below throws.
-  const targetAccount = opts.account ?? getActiveAccount(ctxRoot)?.name ?? 'env';
-
-  // Check cache first (unless force). The cache holds ONE snapshot for whichever
-  // account was checked last, and the snapshot has always carried its own
-  // `account` label — but the read side never compared it. Without this gate,
-  // `check-usage-api --account B` inside the 3-minute TTL is served account A's
-  // numbers, and rotateOAuth's preflight of a candidate account publishes
-  // numbers that are then served as the active account's until the TTL expires.
-  // A mismatch (or a legacy snapshot with no label) is treated as a MISS, which
-  // costs one API call.
-  //
-  // Scope of that guarantee, precisely: the gate keys on the NAME, so it stops a
-  // differently-LABELLED account being served. It does NOT make cache identity
-  // credential-bound. Two different credentials that share a label still collide
-  // — most plainly CLAUDE_CODE_OAUTH_TOKEN being swapped inside the 3-minute TTL
-  // (both snapshots are labelled 'env'), and an account deleted and recreated
-  // under the same name with a different token. Pre-existing and strictly
-  // narrowed, not introduced, by this change; fixing it means keying the cache
-  // on a credential fingerprint, which is a schema change and is filed
-  // separately rather than smuggled in here.
-  if (!opts.force) {
-    const cache = loadCache(ctxRoot);
-    if (cache && cache.expires_at > Date.now() && cache.snapshot?.account === targetAccount) {
-      return { ...cache.snapshot, cached: true };
-    }
-  }
-
-  // Determine which account to check
-  let accessToken: string | undefined;
-  let accountName: string;
-
+  opts: { account?: string; accessToken?: string },
+): UsageCredential {
   if (opts.account) {
     if (opts.accessToken !== undefined) {
       // The caller pinned the exact credential to verify. rotateOAuth needs
@@ -319,27 +346,115 @@ export async function checkUsageApi(
       // be whatever a concurrent refresh happened to leave behind at the moment
       // of THIS read — a different instant from the caller's — and the guard
       // downstream would be comparing against a token it never verified.
-      accessToken = opts.accessToken;
-      accountName = opts.account;
-    } else {
-      const store = loadAccounts(ctxRoot);
-      const acct = store?.accounts[opts.account];
-      if (!acct) throw new Error(`Account "${opts.account}" not found in accounts.json`);
-      accessToken = acct.access_token;
-      accountName = opts.account;
+      return { ok: true, accountName: opts.account, accessToken: opts.accessToken };
     }
-  } else {
-    // Fall back to env / Keychain
-    const active = getActiveAccount(ctxRoot);
-    if (active) {
-      accessToken = active.account.access_token;
-      accountName = active.name;
-    } else {
-      accessToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
-      accountName = 'env';
-      if (!accessToken) throw new Error('No OAuth token available (no accounts.json and CLAUDE_CODE_OAUTH_TOKEN not set)');
+    const store = loadAccounts(ctxRoot);
+    const acct = store?.accounts[opts.account];
+    if (!acct) {
+      return {
+        ok: false,
+        accountName: opts.account,
+        error: new Error(`Account "${opts.account}" not found in accounts.json`),
+      };
+    }
+    return { ok: true, accountName: opts.account, accessToken: acct.access_token };
+  }
+
+  // Fall back to env / Keychain
+  const active = getActiveAccount(ctxRoot);
+  if (active) {
+    return { ok: true, accountName: active.name, accessToken: active.account.access_token };
+  }
+  const envToken = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  if (!envToken) {
+    return {
+      ok: false,
+      accountName: 'env',
+      error: new Error('No OAuth token available (no accounts.json and CLAUDE_CODE_OAUTH_TOKEN not set)'),
+    };
+  }
+  return { ok: true, accountName: 'env', accessToken: envToken };
+}
+
+/**
+ * Does this cache entry belong to the credential being asked about?
+ *
+ * `targetFp === undefined` means no credential could be resolved at all.
+ * Returning true there is deliberate: the name gate alone then decides, which is
+ * exactly the pre-fingerprint behaviour, and it is what keeps the documented
+ * "cached 'env' entry still served after CLAUDE_CODE_OAUTH_TOKEN was unset" path
+ * working. Nothing is weakened by it — with no credential in hand there is no
+ * fetch available either, so the stricter answer is not a fresher number, it is
+ * a thrown error where a usable cached one exists.
+ *
+ * An entry with NO fingerprint (written before the field existed) is a MISS
+ * whenever a credential WAS resolved, mirroring how the name gate treats an
+ * unlabelled snapshot. That costs one API call once per stale entry.
+ */
+function credentialMatches(cache: UsageCache, targetFp: string | undefined): boolean {
+  if (targetFp === undefined) return true;
+  return cache.credential_fp === targetFp;
+}
+
+/**
+ * Fetch utilization from Anthropic usage API for the active account.
+ * Respects 3-minute TTL cache to avoid hitting rate limits.
+ */
+export async function checkUsageApi(
+  ctxRoot: string,
+  opts: { force?: boolean; account?: string; accessToken?: string } = {},
+): Promise<CheckUsageResult> {
+  // Resolve the account being asked about AND its credential before consulting
+  // the cache. This does not throw — see resolveUsageCredential — so an
+  // unresolvable credential still cannot preempt a warm-cache hit; the throw is
+  // deferred to immediately past the gate.
+  const resolved = resolveUsageCredential(ctxRoot, opts);
+  const targetAccount = resolved.accountName;
+  const targetFingerprint = resolved.ok ? credentialFingerprint(resolved.accessToken) : undefined;
+
+  // Check cache first (unless force). The cache holds ONE entry, for whichever
+  // credential was checked last. Two things must match for it to be served:
+  //
+  //   NAME — the snapshot has always carried its own `account` label, but the
+  //   read side did not compare it until recently. Without that, `check-usage-api
+  //   --account B` inside the 3-minute TTL is served account A's numbers, and
+  //   rotateOAuth's preflight of a candidate account publishes numbers that are
+  //   then served as the active account's until the TTL expires.
+  //
+  //   CREDENTIAL — the name alone does not identify a credential, and the name
+  //   is mutable while the credential is what the numbers actually describe. The
+  //   usage API meters a TOKEN; two tokens sharing a label do not share a quota.
+  //   The reachable cases: `refreshOAuthToken` replaces an account's access_token
+  //   in place, so a refresh inside the TTL leaves a warm entry whose label still
+  //   matches but whose numbers belong to the superseded credential;
+  //   CLAUDE_CODE_OAUTH_TOKEN being swapped, where both entries are labelled
+  //   'env'; and an account deleted and recreated under the same name with a
+  //   different token.
+  //
+  // A mismatch on either — or a legacy entry missing the label or the
+  // fingerprint — is a MISS, which costs one API call.
+  if (!opts.force) {
+    const cache = loadCache(ctxRoot);
+    if (
+      cache &&
+      cache.expires_at > Date.now() &&
+      cache.snapshot?.account === targetAccount &&
+      credentialMatches(cache, targetFingerprint)
+    ) {
+      return { ...cache.snapshot, cached: true };
     }
   }
+
+  // Past the gate: now a failure to resolve is fatal, in the same order and with
+  // the same messages as when this resolution lived here inline.
+  if (!resolved.ok) throw resolved.error;
+  const { accessToken, accountName } = resolved;
+
+  // Recomputed rather than reusing targetFingerprint so that what is STORED is
+  // provably the fingerprint of the token this call actually used, independent of
+  // the gate's bookkeeping above. One sha256 of a short string, on a path that is
+  // about to make a network request.
+  const credentialFp = credentialFingerprint(accessToken);
 
   const response = await fetch('https://api.anthropic.com/api/oauth/usage', {
     headers: {
@@ -398,7 +513,7 @@ export async function checkUsageApi(
   };
 
   // Update cache and accounts.json utilization fields
-  saveCache(ctxRoot, snapshot);
+  saveCache(ctxRoot, snapshot, credentialFp);
 
   // Same read-modify-write shape as the refresh path: the whole store is
   // rewritten, so it must re-read under the lock. A missing store or account is
