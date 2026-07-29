@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, beforeEach, vi } from 'vitest';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -110,5 +110,47 @@ describe('goals read-modify-write round-trip', () => {
     fs.rmSync(goalsPath);
     writeGoals(ORG, { bottleneck: 'first', goals: [] });
     expect(readRaw().bottleneck).toBe('first');
+  });
+});
+
+describe('writeGoals — EXDEV safety', () => {
+  /**
+   * rename(2) fails with EXDEV when source and destination are on different
+   * filesystems. Writing the temp file into the OS temp dir (tmpfs, Docker,
+   * systemd PrivateTmp) and renaming it onto the target is therefore a latent
+   * hard write outage. The invariant that makes the rename safe is simply that
+   * both paths live in the SAME directory — which is what this asserts.
+   */
+  it('writes its temp file in the target directory, not the OS temp dir', () => {
+    seed();
+    const realRename = fs.renameSync;
+    const renames: Array<[string, string]> = [];
+    const spy = vi
+      .spyOn(fs, 'renameSync')
+      .mockImplementation(((from: fs.PathLike, to: fs.PathLike) => {
+        renames.push([String(from), String(to)]);
+        return realRename(from, to);
+      }) as typeof fs.renameSync);
+
+    try {
+      writeGoals(ORG, { bottleneck: 'exdev check', goals: [] });
+    } finally {
+      spy.mockRestore();
+    }
+
+    expect(renames).toHaveLength(1);
+    const [from, to] = renames[0];
+    expect(path.resolve(to)).toBe(path.resolve(goalsPath));
+    // The invariant under test.
+    expect(path.dirname(path.resolve(from))).toBe(path.dirname(path.resolve(to)));
+    // And explicitly not the OS temp dir, which is the defect being fixed.
+    expect(path.dirname(path.resolve(from))).not.toBe(path.resolve(os.tmpdir()));
+
+    // The write still lands.
+    expect(JSON.parse(fs.readFileSync(goalsPath, 'utf-8')).bottleneck).toBe('exdev check');
+    // And no temp file is left behind.
+    expect(
+      fs.readdirSync(path.dirname(goalsPath)).filter((f) => f.includes('.tmp.')),
+    ).toEqual([]);
   });
 });
