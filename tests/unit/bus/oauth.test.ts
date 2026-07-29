@@ -14,9 +14,26 @@ vi.stubGlobal('fetch', mockFetch);
 // `active`, so a test can attribute a lock to the specific write it cares about
 // rather than to a total count of acquisitions (which couples unrelated call
 // sites together and misreports which one regressed).
-const { lockedDirs, lockedSections } = vi.hoisted(() => ({
+// `envProbe.path`, when set, makes each locked section record what that agent
+// .env held at the moment the section STARTED and again when it ENDED. That
+// timing is the whole point: it is what distinguishes "phase 2 ran inside the
+// lock" from "phase 2 ran after it", which no end-state assertion can tell apart
+// in one process.
+//
+// Both ends are recorded, not just the exit. An exit-only probe says the token
+// was present by the time the section closed, which is also true of a write that
+// happened BEFORE the lock was ever acquired — so exit alone cannot place the
+// write inside the section. Entry-old plus exit-new brackets it.
+const { lockedDirs, lockedSections, envProbe } = vi.hoisted(() => ({
   lockedDirs: [] as string[],
-  lockedSections: [] as { dir: string; activeBefore?: string; activeAfter?: string }[],
+  lockedSections: [] as {
+    dir: string;
+    activeBefore?: string;
+    activeAfter?: string;
+    envAtSectionStart?: string;
+    envAtSectionEnd?: string;
+  }[],
+  envProbe: { path: null as string | null },
 }));
 vi.mock('../../../src/utils/lock.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../../../src/utils/lock.js')>();
@@ -39,9 +56,20 @@ vi.mock('../../../src/utils/lock.js', async (importOriginal) => {
       return actual.withFileLockSync(
         dir,
         () => {
+          const readEnv = (): string | undefined => {
+            if (!envProbe.path) return undefined;
+            try { return readFileSync(envProbe.path, 'utf-8'); } catch { return undefined; }
+          };
           const activeBefore = readActive();
+          const envAtSectionStart = readEnv();
           const result = fn();
-          lockedSections.push({ dir, activeBefore, activeAfter: readActive() });
+          lockedSections.push({
+            dir,
+            activeBefore,
+            activeAfter: readActive(),
+            envAtSectionStart,
+            envAtSectionEnd: readEnv(),
+          });
           return result;
         },
         opts as never,
@@ -125,6 +153,7 @@ beforeEach(() => {
   // leave a mockImplementationOnce queued by a failed test to leak forward.
   mockAtomicWrite.mockReset();
   mockAtomicWrite.mockImplementation(actualAtomic.atomicWriteSync);
+  envProbe.path = null;
 });
 
 afterEach(() => {
@@ -659,6 +688,73 @@ describe('rotateOAuth', () => {
         && s.activeAfter === 'secondary',
     );
     expect(activated).toHaveLength(1);
+  });
+
+  it('distributes the token to agent .env inside the section that commits accounts.json', async () => {
+    // Phase 1 and phase 2 are only atomic if they share a critical section.
+    // In one process the END STATE is identical either way — accounts.json says
+    // secondary, the .env holds secondary's token — so no end-state assertion
+    // can tell the fix from the bug. What distinguishes them is WHEN the .env
+    // write lands: inside the lock, the section that flips active
+    // primary -> secondary has already written the .env by the time it ends;
+    // outside, that same section ends with the .env still on primary's token.
+    //
+    // That is also why this cannot be asserted by simulating a competing
+    // rotation. The interleaving that does the damage needs a second process
+    // descheduling this one between the two writes, and there is no such seam
+    // in-process. The lock is the observable stand-in for it.
+    const { mkdirSync, writeFileSync } = require('fs');
+    const fwRoot = mkdtempSync(join(tmpdir(), 'cortextos-fw-'));
+    const agentDir = join(fwRoot, 'orgs', 'acme', 'agents', 'rally-builder');
+    const envPath = join(agentDir, '.env');
+    mkdirSync(agentDir, { recursive: true });
+    writeFileSync(envPath, 'CLAUDE_CODE_OAUTH_TOKEN=tok_primary_abc\n');
+
+    try {
+      writeStore({
+        ...SAMPLE_STORE,
+        accounts: {
+          ...SAMPLE_STORE.accounts,
+          primary: { ...SAMPLE_STORE.accounts.primary, five_hour_utilization: 0.90 },
+        },
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ five_hour_utilization: 0.1, seven_day_utilization: 0.05 }),
+      });
+
+      envProbe.path = envPath;
+      lockedSections.length = 0;
+      const result = await rotateOAuth(tmpDir, fwRoot, 'acme');
+      expect(result.rotated, `rotation was blocked with: ${result.reason}`).toBe(true);
+
+      const oauthStateDir = join(tmpDir, 'state', 'oauth');
+      const committing = lockedSections.filter(
+        (s) => s.dir === oauthStateDir
+          && s.activeBefore === 'primary'
+          && s.activeAfter === 'secondary',
+      );
+      // Deliberately ONE assertion over the whole bracket. Splitting it into a
+      // length check followed by content checks would put the length claim
+      // first, and an arm that dies there reports "wrong number of sections"
+      // for what is actually an unlocked .env write — a different defect than
+      // the one in this arm's name.
+      //
+      // The start value is asserted too, not just the end: end-alone is equally
+      // satisfied by a write that landed before the lock was taken, so it would
+      // pass on an implementation that never held the lock for phase 2 at all.
+      expect(
+        committing.map((s) => ({
+          start: s.envAtSectionStart ?? '<no .env>',
+          end: s.envAtSectionEnd ?? '<no .env>',
+        })),
+      ).toEqual([{
+        start: expect.stringContaining('tok_primary_abc'),
+        end: expect.stringContaining('tok_secondary_def'),
+      }]);
+    } finally {
+      rmSync(fwRoot, { recursive: true, force: true });
+    }
   });
 
   it('rotates when 5h utilization exceeds threshold', async () => {

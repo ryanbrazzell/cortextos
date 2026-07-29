@@ -145,12 +145,40 @@ function saveAccounts(ctxRoot: string, store: AccountsStore): void {
  * anything deferred past its return (an await, a callback) runs UNLOCKED. Do
  * network work before calling this and apply only the result in here.
  *
+ * `afterCommit` runs INSIDE the same critical section, immediately after
+ * accounts.json is saved, and only on the path where it was saved. It exists for
+ * writes that must not be observable separately from the commit — see phase 2 of
+ * rotateOAuth, where a lock released between the two leaves agents holding a
+ * token accounts.json no longer names as active. It deliberately runs after the
+ * save rather than inside `mutate`, so the durability order (accounts.json, then
+ * anything derived from it) is the same as when the two were separate.
+ *
+ * It carries the same synchronous requirement as `mutate`: an `async` afterCommit
+ * type-checks against a `void` return, then resumes its body after the lock is
+ * gone and silently reinstates the exact bug this parameter was added to remove.
+ * The thenable check below DETECTS that; it does not prevent it. By the time a
+ * Promise comes back the callback has already started, and throwing here cannot
+ * cancel its post-await continuation — that continuation still runs unlocked,
+ * and its rejection surfaces as an unhandled one rather than through this throw.
+ * The check is a loud failure at the call site instead of a silent race, and
+ * that is all it is. `mutate` has the identical trap with no check at all; it is
+ * left alone rather than widening this change to three existing call sites that
+ * are all synchronous today.
+ *
+ * If `afterCommit` throws, accounts.json has ALREADY been replaced — this
+ * function throws instead of returning true, so a caller cannot distinguish
+ * "committed, follow-up failed" from "committed nothing" by return value alone.
+ * Treat a throw as "the commit landed, the follow-up state is unknown". No
+ * current caller can reach it (writeTokenToAgents swallows every per-agent
+ * error), but the contract permits it.
+ *
  * Returns false without writing when accounts.json is missing or `mutate`
  * returns false; callers decide whether that is benign or an error.
  */
 function withAccountsLock(
   ctxRoot: string,
   mutate: (store: AccountsStore) => boolean,
+  afterCommit?: (store: AccountsStore) => void,
 ): boolean {
   const dir = oauthDir(ctxRoot);
   ensureDir(dir);
@@ -159,6 +187,15 @@ function withAccountsLock(
     if (!store) return false;
     if (!mutate(store)) return false;
     saveAccounts(ctxRoot, store);
+    if (afterCommit) {
+      const returned: unknown = afterCommit(store);
+      if (typeof (returned as { then?: unknown } | null | undefined)?.then === 'function') {
+        throw new Error(
+          'withAccountsLock: afterCommit returned a thenable. It must be synchronous — ' +
+          'its body would otherwise resume after the lock is released.',
+        );
+      }
+    }
     return true;
   });
 }
@@ -434,9 +471,14 @@ export async function refreshOAuthToken(
 /**
  * Rotate the active OAuth account based on utilization thresholds.
  *
- * Two-phase write:
+ * Two-phase write, both phases in ONE critical section:
  *   Phase 1: accounts.json (permanent, written after refresh)
  *   Phase 2: agent .env files (conditional on preflight passing)
+ *
+ * The phases are ordered but not separable. A lock released between them lets a
+ * competing rotation commit and distribute in the gap, after which this call's
+ * phase 2 overwrites every agent .env with the token its own — now superseded —
+ * phase 1 chose.
  */
 export async function rotateOAuth(
   ctxRoot: string,
@@ -594,7 +636,45 @@ export async function rotateOAuth(
     next.seven_day_utilization = preflight.seven_day_utilization;
     reloaded.rotation_log = [logEntry, ...reloaded.rotation_log].slice(0, ROTATION_LOG_MAX);
     return true;
-  });
+  },
+  // PHASE 2, inside the SAME critical section as phase 1 rather than after it.
+  //
+  // Distribute the token the guard above just proved is both preflighted and
+  // committed — NOT a fresh read of the store. That read happened after the
+  // lock was released, so a refresh landing in the gap would push a token no
+  // one verified to every agent, re-opening on the unlocked side exactly the
+  // hole the in-lock credential check closes. It also dropped the store's
+  // reload behind a non-null assertion that would throw if accounts.json became
+  // unreadable in that same gap.
+  //
+  // Holding the lock across it closes a second, independent hole. With phase 2
+  // outside, a rotation that had already committed could be descheduled here
+  // while another process ran a whole rotation — commit and distribution both —
+  // and then overwrite every agent .env with its own superseded token. The
+  // store named the winner while every agent ran the loser, and a partial
+  // interleave could strand different agents on different tokens. Serializing
+  // the two writes is what makes "the active account and the distributed token
+  // agree" a property of the file rather than of scheduling luck.
+  //
+  // Scope of that claim, precisely — it is narrower than "atomic" on its own
+  // suggests. It serializes rotation's two writes against another WRITER. It
+  // does not make them atomic to a READER: nothing that reads an agent .env
+  // takes this lock, so an agent starting up mid-distribution can still observe
+  // some .env files updated and others not. And it does not make accounts.json
+  // and the .env files agree in general — refreshOAuthToken commits a new
+  // access_token for an account without touching any .env, an `opts.agent`-scoped
+  // rotation updates one agent and leaves the rest, and writeTokenToAgents
+  // swallows per-agent write failures, so a rotation can report success having
+  // updated only some agents. All three survive this change untouched.
+  //
+  // Cost, deliberately accepted: the lock is now held across N synchronous
+  // .env writes instead of released before them. Those are microseconds against
+  // withFileLockSync's 5s acquire timeout, but the extra contention is not paid
+  // by rotation — it is paid by a concurrent refreshOAuthToken, whose persist
+  // throws on acquire timeout AFTER the network refresh has already spent the
+  // old refresh_token. Small odds, expensive failure; worth naming rather than
+  // rounding to zero.
+  () => writeTokenToAgents(frameworkRoot, org, preflightedToken, opts.agent));
 
   if (!committed) {
     // Distinguish a lost race from a corrupted store — they need different
@@ -620,17 +700,6 @@ export async function rotateOAuth(
     }
     return { rotated: false, reason };
   }
-
-  // PHASE 2: Write bare access token to agent .env files.
-  //
-  // Distribute the token the guard above just proved is both preflighted and
-  // committed — NOT a fresh read of the store. That read happened after the
-  // lock was released, so a refresh landing in the gap would push a token no
-  // one verified to every agent, re-opening on the unlocked side exactly the
-  // hole the in-lock credential check closes. It also dropped the store's
-  // reload behind a non-null assertion that would throw if accounts.json became
-  // unreadable in that same gap.
-  writeTokenToAgents(frameworkRoot, org, preflightedToken, opts.agent);
 
   return {
     rotated: true,
