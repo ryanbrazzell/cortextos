@@ -6,6 +6,7 @@ import { spawnSync } from 'child_process';
 import { validateAgentName } from '../utils/validate.js';
 import { IPCClient } from '../daemon/ipc-server.js';
 import { resolvePaths } from '../utils/paths.js';
+import { writeAgentConfig } from '../utils/agent-config';
 
 interface ExportManifest {
   version: string;
@@ -129,7 +130,11 @@ export const importAgentCommand = new Command('import-agent')
         never_ask: [],
       },
     };
-    writeFileSync(join(targetAgentDir, 'config.json'), JSON.stringify(fullConfig, null, 2) + '\n', 'utf-8');
+    // Locked + atomic even though this replaces the whole file rather than
+    // amending it: an unlocked write here can land inside another process's
+    // read-modify-write on the same config.json and be discarded by that
+    // process's write-back. Same lock directory as every other writer.
+    writeAgentConfig(targetAgentDir, fullConfig);
 
     // Copy state (tasks, memory) from export if present
     const exportedStateDir = join(tmpDir, 'state');

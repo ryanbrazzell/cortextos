@@ -4,6 +4,7 @@ import { join, resolve } from 'path';
 import { homedir } from 'os';
 import { OrgContext } from '../types';
 import { validateAgentName, validateOrgName } from '../utils/validate';
+import { mutateAgentConfig } from '../utils/agent-config';
 
 const VALID_RUNTIMES = ['claude-code', 'hermes', 'codex-app-server', 'opencode'] as const;
 type RuntimeKind = typeof VALID_RUNTIMES[number];
@@ -170,30 +171,37 @@ export const addAgentCommand = new Command('add-agent')
       }, null, 2) + '\n', 'utf-8');
     }
 
-    // Create config.json
+    // Create config.json, and persist a non-default runtime into it regardless
+    // of whether the file came from a template or is being created here — the
+    // template-supplied config.json wins file existence, so this has to
+    // read-merge-write to inject the runtime field that agent-process.ts
+    // branches on.
+    //
+    // These were two separate unlocked steps: an `existsSync`-guarded create,
+    // then a read-modify-write. Both the guard and the read now sit inside one
+    // transaction, because `existsSync` -> `write` is itself check-then-act and
+    // a lock that started after the read would still write back a stale object.
     const configPath = join(agentDir, 'config.json');
-    if (!existsSync(configPath)) {
-      writeFileSync(configPath, JSON.stringify({
-        agent_name: name,
-        startup_delay: 0,
-        max_session_seconds: 255600,
-        enabled: true,
-        crons: [],
-      }, null, 2) + '\n', 'utf-8');
-    }
-
-    // Persist non-default runtime into config.json regardless of whether the
-    // file came from a template or was created above. The template-supplied
-    // config.json wins file existence, so we read-merge-write to inject the
-    // runtime field that agent-process.ts branches on.
-    if (options.runtime !== 'claude-code' && existsSync(configPath)) {
-      try {
-        const existingCfg = JSON.parse(readFileSync(configPath, 'utf-8'));
-        existingCfg.runtime = options.runtime;
-        writeFileSync(configPath, JSON.stringify(existingCfg, null, 2) + '\n', 'utf-8');
-      } catch (err) {
-        console.error(`Warning: failed to set runtime field in config.json: ${(err as Error).message}`);
-      }
+    try {
+      mutateAgentConfig(agentDir, (cfg, existed) => {
+        if (!existed) {
+          cfg.agent_name = name;
+          cfg.startup_delay = 0;
+          cfg.max_session_seconds = 255600;
+          cfg.enabled = true;
+          cfg.crons = [];
+        } else if (options.runtime === 'claude-code') {
+          // Template supplied the file and there is no runtime to inject:
+          // decline rather than rewrite identical bytes and churn the mtime.
+          return false;
+        }
+        if (options.runtime !== 'claude-code') cfg.runtime = options.runtime;
+      });
+    } catch (err) {
+      // Was already non-fatal for the read-modify-write half. Kept non-fatal so
+      // a corrupt template config.json (or a lock timeout) does not abandon a
+      // half-created agent directory behind a non-zero exit.
+      console.error(`Warning: failed to write config.json: ${(err as Error).message}`);
     }
 
     // Create .env placeholder with helpful comments
@@ -277,11 +285,21 @@ export const addAgentCommand = new Command('add-agent')
           writeFileSync(join(agentDir, 'SYSTEM.md'), systemMd, 'utf-8');
         } catch { /* leave template SYSTEM.md in place on write error */ }
 
-        // Seed org-level tuning knobs into agent config.json
+        // Seed org-level tuning knobs into agent config.json.
+        //
+        // Second locked transaction rather than one held across the block
+        // above: SYSTEM.md generation, the template copy and the symlink
+        // install sit in between, and holding a 5s mutex across unbounded
+        // filesystem work would turn contention into timeouts.
+        //
+        // The path is the `configPath` computed earlier, not a re-derived
+        // `join(agentDir, 'config.json')`, so the locked directory and the
+        // written file cannot drift apart.
         try {
-          const agentConfigPath = join(agentDir, 'config.json');
-          if (existsSync(agentConfigPath)) {
-            const agentCfg = JSON.parse(readFileSync(agentConfigPath, 'utf-8'));
+          mutateAgentConfig(agentDir, (agentCfg, existed) => {
+            // Same guard as before, now inside the lock: nothing to amend if
+            // the file is not there.
+            if (!existed) return false;
             agentCfg.timezone = ctx.timezone || 'UTC';
             // Only seed day_mode_start/end if they look like valid HH:MM strings
             const timeRegex = /^\d{2}:\d{2}$/;
@@ -296,9 +314,13 @@ export const addAgentCommand = new Command('add-agent')
                 : ['external-comms', 'financial', 'deployment', 'data-deletion'],
               never_ask: [],
             };
-            writeFileSync(agentConfigPath, JSON.stringify(agentCfg, null, 2) + '\n', 'utf-8');
-          }
-        } catch { /* org context may be incomplete — agent keeps template defaults */ }
+          });
+        } catch (err) {
+          // Was a silent `catch {}`. A swallowed JSON parse error was already
+          // bad; silently swallowing a lock timeout would be worse — the agent
+          // keeps template defaults and nothing anywhere says why.
+          console.error(`Warning: failed to seed org settings into config.json: ${(err as Error).message}`);
+        }
       }
     }
 
