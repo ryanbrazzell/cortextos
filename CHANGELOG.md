@@ -11,7 +11,7 @@
 
 ## [0.2.0] — 2026-05-04 — External Persistent Crons
 
-Crons move from session-local (`/loop`, `CronCreate`) to daemon-managed `crons.json` files under `${CTX_ROOT}/state/{agent}/`. Auto-migrates from existing `config.json` on first daemon boot. Fully backward-compatible additive feature.
+Crons move from session-local (`/loop`, `CronCreate`) to daemon-managed `crons.json` files under `${CTX_ROOT}/.cortextOS/state/agents/{agent}/`. Auto-migrates from existing `config.json` on first daemon boot. Fully backward-compatible additive feature.
 
 ### Phase 5.4 — Race Hardening & Workspace Teaching
 
@@ -45,7 +45,7 @@ Crons move from session-local (`/loop`, `CronCreate`) to daemon-managed `crons.j
 
 ### Phase 1–3 — External Persistent Cron Engine
 
-- Crons migrated from session-local (`/loop` / `CronCreate`) to daemon-managed `crons.json` files under `${CTX_ROOT}/state/{agent}/`.
+- Crons migrated from session-local (`/loop` / `CronCreate`) to daemon-managed `crons.json` files under `${CTX_ROOT}/.cortextOS/state/agents/{agent}/`.
 - `CronScheduler` with 30-second tick, 5-field cron expression parser, interval shorthand support, catch-up-once policy, and 3-attempt exponential backoff (1s/4s/16s).
 - `readCrons` / `writeCrons` / `addCron` / `updateCron` / `removeCron` / `getCronByName` in `src/bus/crons.ts`.
 - Auto-migration from `config.json` on first daemon boot per agent (`.crons-migrated` marker).
