@@ -28,8 +28,9 @@
  *        next start sees cron as overdue and fires catch-up.
  * FM-7: Log rotation under concurrent write pressure — 100+ simultaneous
  *        appends while size threshold is exceeded; rotation stays atomic.
- * FM-8: Cron-expression local-time behavior — scheduler uses Date.getHours()
- *        (local wall clock, not UTC); documented behavior, tested for consistency.
+ * FM-8: Cron-expression UTC behavior — scheduler reads the fields with getUTC*,
+ *        so schedules are independent of the process timezone. Forces a non-UTC
+ *        TZ so the assertions cannot pass vacuously on a UTC runner.
  * FM-9: IPC reload during active catch-up — schedule-change mid-flight via
  *        reload() while a cron is in its firing guard (firing=true).
  *
@@ -831,88 +832,122 @@ describe('FM-7: Log rotation under concurrent write pressure', () => {
 // FM-8: Cron-expression local-time behavior
 // ---------------------------------------------------------------------------
 
-describe('FM-8: Cron-expression local-time behavior — consistent with Date.getHours()', () => {
-  it('fixed-hour cron expression fires at the correct local hour', async () => {
-    // DOCUMENTED BEHAVIOR: The scheduler uses Date.getHours() (local wall clock).
-    // Cron expression `0 H * * *` fires at H:00 LOCAL time, not H:00 UTC.
-    // This is consistent with the standard cron behavior on most systems.
-    //
-    // We test this by setting a known start time, computing the expected local-hour
-    // fire time, and verifying the scheduler fires at that moment.
+describe('FM-8: Cron-expression UTC behavior — independent of the process timezone', () => {
+  // CHOSEN BEHAVIOR: cron expressions are interpreted in UTC.
+  //
+  // This block previously asserted the opposite — that `0 H * * *` fires at H:00
+  // LOCAL time, on the grounds that system cron is local-time. That argument is
+  // real, but it is not the semantics this fleet runs on, and the two cannot
+  // both be true:
+  //
+  //   1. Operational practice already assumes UTC. Every cron in the org is
+  //      written as a UTC expression (the docs say "convert your local hour
+  //      before writing the expression"). Local-time semantics would silently
+  //      shift all of them.
+  //   2. It closes an ambient-dependence bug class rather than dodging it.
+  //      `nextFireFromCron` is called from two processes — the daemon scheduler,
+  //      which decides the real fire time, and `bus list-crons`, which prints a
+  //      "Next Fire" column explicitly labelled UTC. They do not share a TZ env,
+  //      so under local-time fields they disagree by the offset. Worse,
+  //      `cortextos start` forwards {...process.env} to the daemon it spawns, so
+  //      a daemon started from a shell with TZ set would shift every
+  //      cron-expression schedule by that offset.
+  //
+  // The fix reads the fields with getUTC* explicitly rather than relying on the
+  // daemon's environment happening to have no TZ set — so these tests force a
+  // non-UTC TZ and assert the offset actually took effect. Without that control
+  // they would pass on a UTC CI runner under EITHER semantics, which is exactly
+  // why the original TZ-dependence went unnoticed.
 
-    const agent = 'fm-localtime';
+  const originalTZ = process.env.TZ;
+
+  afterEach(() => {
+    if (originalTZ === undefined) delete process.env.TZ;
+    else process.env.TZ = originalTZ;
+  });
+
+  /** Set the process TZ and prove it took effect, so nothing below is vacuous. */
+  function forceTZ(tz: string, expectedOffsetMin: number) {
+    process.env.TZ = tz;
+    expect(new Date(Date.UTC(2026, 6, 29)).getTimezoneOffset()).toBe(expectedOffsetMin);
+  }
+
+  it('fixed-hour cron expression fires at the UTC hour, not the local hour', async () => {
+    // Start at an absolute instant: 2026-07-29 00:00 UTC, which is 17:00 on
+    // 2026-07-28 in PDT. `0 3 * * *` therefore resolves to:
+    //   03:00 UTC (+3h)   reading the fields in UTC   — correct
+    //   10:00 UTC (+10h)  reading them as local 3am   — the bug
+    // Advancing 4h distinguishes them: one fire vs none.
+    forceTZ('America/Los_Angeles', 420); // UTC-7 (PDT) on this date
+
+    const agent = 'fm-utc-hour';
     ensureAgentDir(agent);
 
     const fired: number[] = [];
 
-    // Set start to midnight local time on a known day
-    // Use fake timers to set a concrete start — midnight local (getHours() = 0)
-    const now = Date.now();
-    // Find midnight local time: floor to day boundary
-    const d = new Date(now);
-    d.setHours(0, 0, 0, 0); // midnight local
-    const midnightLocal = d.getTime();
-    vi.setSystemTime(midnightLocal);
+    const startUtc = Date.UTC(2026, 6, 29, 0, 0, 0);
+    vi.setSystemTime(startUtc);
 
-    // Schedule cron for 3am local (avoids DST ambiguity in spring/fall transitions)
-    addCron(agent, makeCronDef('local-3am', '0 3 * * *'));
+    // 3am avoids DST ambiguity in the spring/fall transition windows.
+    addCron(agent, makeCronDef('utc-3am', '0 3 * * *'));
 
     const scheduler = buildScheduler(agent, () => {
       fired.push(Date.now());
     });
     scheduler.start();
 
-    // Advance 4 hours (past the 3:00am window)
+    // Advance 4 hours — past 03:00 UTC, but well short of 10:00 UTC.
     await advanceSim(4 * ONE_HOUR);
 
     // Exactly 1 fire in 4 hours
     expect(fired.length).toBe(1);
 
-    // The fire time should be at or after 3:00am local
-    const expectedFireMs = midnightLocal + 3 * ONE_HOUR;
+    // Pinned to an absolute instant, not re-derived from the same clock frame
+    // the implementation read.
+    const expectedFireMs = Date.UTC(2026, 6, 29, 3, 0, 0);
     expect(fired[0]).toBeGreaterThanOrEqual(expectedFireMs);
     expect(fired[0]).toBeLessThan(expectedFireMs + 2 * TICK_MS); // within 1 tick
 
     scheduler.stop();
   });
 
-  it('weekday-only cron (0 9 * * 1-5) does not fire on Sunday — fires on next Monday', async () => {
-    // Find a known Sunday: compute the next Sunday from now.
+  it('weekday-only cron (0 9 * * 1-5) picks the weekday from the UTC calendar day', async () => {
+    // 2026-08-02 00:00 UTC is Sunday in UTC — but Saturday 17:00 in PDT. The
+    // day-of-week field must come from the UTC calendar, so the cron stays
+    // silent through Sunday and fires Monday 09:00 UTC (not 09:00 PDT, which is
+    // Monday 16:00 UTC and outside the window advanced below).
+    forceTZ('America/Los_Angeles', 420);
+
     const agent = 'fm-weekday-sunday';
     ensureAgentDir(agent);
 
-    const fired: string[] = [];
+    const fired: number[] = [];
 
-    // Set time to a Sunday at midnight local
-    // Find next Sunday
-    const now = Date.now();
-    const d = new Date(now);
-    d.setHours(0, 0, 0, 0);
-    // Advance to Sunday (getDay() = 0)
-    while (d.getDay() !== 0) {
-      d.setDate(d.getDate() + 1);
-    }
-    const sundayMidnightLocal = d.getTime();
-    vi.setSystemTime(sundayMidnightLocal);
+    const sundayMidnightUtc = Date.UTC(2026, 7, 2, 0, 0, 0);
+    expect(new Date(sundayMidnightUtc).getUTCDay()).toBe(0); // Sunday in UTC
+    vi.setSystemTime(sundayMidnightUtc);
 
     addCron(agent, makeCronDef('weekday-9am', '0 9 * * 1-5'));
 
     const scheduler = buildScheduler(agent, () => {
-      fired.push(new Date(Date.now()).toISOString());
+      fired.push(Date.now());
     });
     scheduler.start();
 
-    // Advance 24h (through Sunday only)
+    // Advance 24h — all of Sunday, in UTC.
     await advanceSim(24 * ONE_HOUR);
 
-    // No fire on Sunday (day 0)
+    // No fire on Sunday (UTC day 0)
     expect(fired.length).toBe(0);
 
-    // Advance into Monday (another 9h+)
+    // Advance into Monday (another 10h, so past 09:00 UTC but before 16:00 UTC)
     await advanceSim(10 * ONE_HOUR);
 
-    // Should fire on Monday at 9am local
+    // Fires on Monday at 09:00 UTC
     expect(fired.length).toBe(1);
+    const expectedFireMs = Date.UTC(2026, 7, 3, 9, 0, 0);
+    expect(fired[0]).toBeGreaterThanOrEqual(expectedFireMs);
+    expect(fired[0]).toBeLessThan(expectedFireMs + 2 * TICK_MS);
 
     scheduler.stop();
   });
