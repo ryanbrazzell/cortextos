@@ -223,7 +223,10 @@ export function autoCommit(projectDir: string, dryRun: boolean = false): AutoCom
  */
 export function checkGoalStaleness(
   projectRoot: string,
-  thresholdDays: number = 7,
+  // 1 day, matching the daily goal-refresh cadence. Kept in sync with the
+  // --threshold default in cli/bus.ts; a drift between the two would be the
+  // same writer/reader mismatch class as the parse bug above.
+  thresholdDays: number = 1,
 ): GoalStalenessReport {
   const agents: AgentGoalStatus[] = [];
   const thresholdMs = thresholdDays * 86400 * 1000;
@@ -326,8 +329,13 @@ export function checkGoalStaleness(
         continue;
       }
 
-      // Parse ISO 8601 timestamp
-      const parsedDate = new Date(updatedLine);
+      // Parse ISO 8601 timestamp. `goals generate-md` writes the line as
+      // "<timestamp> (by <author>)" when an author is known (see cli/goals.ts),
+      // so parse the leading timestamp instead of the whole line.
+      const isoMatch = updatedLine.match(
+        /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?/,
+      );
+      const parsedDate = new Date(isoMatch ? isoMatch[0] : updatedLine);
       if (isNaN(parsedDate.getTime())) {
         agents.push({
           agent: agentName,

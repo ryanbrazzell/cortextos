@@ -692,11 +692,20 @@ busCommand
 busCommand
   .command('check-goal-staleness')
   .description('Detect agents with stale GOALS.md')
-  .option('--threshold <days>', 'Staleness threshold in days', '7')
+  .option('--threshold <days>', 'Staleness threshold in days (fractional allowed)', '1')
   .action((opts: { threshold: string }) => {
     const env = resolveEnv();
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
-    const report = checkGoalStaleness(projectRoot, parseInt(opts.threshold, 10));
+    // parseFloat, not parseInt: sub-day thresholds are the common case for
+    // agents on a daily refresh cadence. Reject non-numeric input outright —
+    // NaN would otherwise make every comparison false and silently report
+    // every agent as fresh.
+    const threshold = parseFloat(opts.threshold);
+    if (!Number.isFinite(threshold) || threshold <= 0) {
+      console.error(`Invalid --threshold: ${opts.threshold} (expected a positive number of days)`);
+      process.exit(1);
+    }
+    const report = checkGoalStaleness(projectRoot, threshold);
     console.log(JSON.stringify(report, null, 2));
   });
 
