@@ -223,7 +223,10 @@ export function autoCommit(projectDir: string, dryRun: boolean = false): AutoCom
  */
 export function checkGoalStaleness(
   projectRoot: string,
-  thresholdDays: number = 7,
+  // 1 day, matching the daily goal-refresh cadence. Kept in sync with the
+  // --threshold default in cli/bus.ts; a drift between the two would be the
+  // same writer/reader mismatch class as the parse bug above.
+  thresholdDays: number = 1,
 ): GoalStalenessReport {
   const agents: AgentGoalStatus[] = [];
   const thresholdMs = thresholdDays * 86400 * 1000;

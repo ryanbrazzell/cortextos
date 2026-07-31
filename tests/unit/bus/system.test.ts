@@ -285,6 +285,19 @@ describe('Bus System', () => {
       expect(checkGoalStaleness(testDir, 0.5).agents[0].status).toBe('stale');
     });
 
+    it('defaults to a 1-day threshold', () => {
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+
+      // 2 days old: stale under the 1-day default, fresh under the old 7-day one.
+      const date = new Date(Date.now() - 2 * 86400 * 1000).toISOString();
+      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${date} (by orchestrator)\n`);
+
+      const report = checkGoalStaleness(testDir);
+      expect(report.summary.threshold_days).toBe(1);
+      expect(report.agents[0].status).toBe('stale');
+    });
+
     it('returns empty report when no orgs directory', () => {
       const report = checkGoalStaleness(testDir);
       expect(report.summary.total).toBe(0);

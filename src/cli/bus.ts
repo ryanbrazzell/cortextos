@@ -692,7 +692,7 @@ busCommand
 busCommand
   .command('check-goal-staleness')
   .description('Detect agents with stale GOALS.md')
-  .option('--threshold <days>', 'Staleness threshold in days (fractional allowed)', '7')
+  .option('--threshold <days>', 'Staleness threshold in days (fractional allowed)', '1')
   .action((opts: { threshold: string }) => {
     const env = resolveEnv();
     const projectRoot = env.projectRoot || env.frameworkRoot || process.cwd();
