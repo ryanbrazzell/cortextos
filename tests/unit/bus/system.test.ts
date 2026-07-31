@@ -237,6 +237,54 @@ describe('Bus System', () => {
       expect(report.agents[0].stale).toBe(true);
     });
 
+    // `goals generate-md` writes "<timestamp> (by <author>)" whenever an author
+    // is known, which is the norm for orchestrator-refreshed goals. Parsing the
+    // whole line rejects that, so every such agent reported parse_error.
+    it('parses a timestamp carrying the generator author annotation', () => {
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+
+      const recentDate = new Date(Date.now() - 2 * 86400 * 1000).toISOString();
+      writeFileSync(
+        join(agentDir, 'GOALS.md'),
+        `# Goals\n\n## Updated\n${recentDate} (by orchestrator)\n`,
+      );
+
+      const report = checkGoalStaleness(testDir, 7);
+      expect(report.agents[0].status).toBe('fresh');
+      // age_days pins the instant actually parsed — 'fresh' alone would also
+      // hold if the parser silently fell back to "now".
+      expect(report.agents[0].age_days).toBe(2);
+      expect(report.summary.fresh).toBe(1);
+    });
+
+    it('still detects staleness through the author annotation', () => {
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+
+      const oldDate = new Date(Date.now() - 10 * 86400 * 1000).toISOString();
+      writeFileSync(
+        join(agentDir, 'GOALS.md'),
+        `# Goals\n\n## Updated\n${oldDate} (by orchestrator)\n`,
+      );
+
+      const report = checkGoalStaleness(testDir, 7);
+      expect(report.agents[0].status).toBe('stale');
+      expect(report.agents[0].age_days).toBe(10);
+    });
+
+    it('supports sub-day thresholds', () => {
+      const agentDir = join(testDir, 'orgs', 'myorg', 'agents', 'worker');
+      mkdirSync(agentDir, { recursive: true });
+
+      // 18h old: fresh against a 1-day threshold, stale against 12h.
+      const date = new Date(Date.now() - 18 * 3600 * 1000).toISOString();
+      writeFileSync(join(agentDir, 'GOALS.md'), `# Goals\n\n## Updated\n${date} (by orchestrator)\n`);
+
+      expect(checkGoalStaleness(testDir, 1).agents[0].status).toBe('fresh');
+      expect(checkGoalStaleness(testDir, 0.5).agents[0].status).toBe('stale');
+    });
+
     it('returns empty report when no orgs directory', () => {
       const report = checkGoalStaleness(testDir);
       expect(report.summary.total).toBe(0);

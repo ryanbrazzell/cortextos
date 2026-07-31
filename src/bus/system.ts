@@ -326,8 +326,13 @@ export function checkGoalStaleness(
         continue;
       }
 
-      // Parse ISO 8601 timestamp
-      const parsedDate = new Date(updatedLine);
+      // Parse ISO 8601 timestamp. `goals generate-md` writes the line as
+      // "<timestamp> (by <author>)" when an author is known (see cli/goals.ts),
+      // so parse the leading timestamp instead of the whole line.
+      const isoMatch = updatedLine.match(
+        /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?/,
+      );
+      const parsedDate = new Date(isoMatch ? isoMatch[0] : updatedLine);
       if (isNaN(parsedDate.getTime())) {
         agents.push({
           agent: agentName,
