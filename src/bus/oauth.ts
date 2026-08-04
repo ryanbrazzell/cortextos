@@ -959,7 +959,18 @@ function writeTokenToAgents(
         content = content.trimEnd() + `\nCLAUDE_CODE_OAUTH_TOKEN=${token}\n`;
       }
 
-      atomicWriteSync(envPath, content);
+      // atomicWriteSync appends its own trailing newline, and `content` here
+      // came off disk (or out of the append branch above) already ending in
+      // one. Without the trim every rotation left an extra blank line behind
+      // and nothing ever removed it, so each agent .env grew by a byte per
+      // rotation. Trim here rather than in atomicWriteSync: the other 30-odd
+      // call sites hand it JSON.stringify output with no trailing newline and
+      // depend on that append.
+      //
+      // Strip newlines only, not all trailing whitespace: trimEnd() would also
+      // eat spaces or tabs off the last variable's value, and on a CRLF file it
+      // would take the \r with it and silently rewrite that line's ending.
+      atomicWriteSync(envPath, content.replace(/\n+$/, ''));
       try { chmodSync(envPath, 0o600); } catch { /* ignore */ }
     } catch (err) {
       // Record and keep going — this agent is stranded on the OLD token.
