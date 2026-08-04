@@ -171,9 +171,24 @@ function sendCrashLoopAlertBestEffort(
       '-d', `chat_id=${creds.chatId}`,
       '--data-urlencode', `text=${message}`,
     ], { timeout: TELEGRAM_SEND_TIMEOUT_MS, stdio: 'pipe' });
+    // curl exits 0 for any completed HTTP exchange, including a 4xx from
+    // Telegram (revoked token, chat_not_found, bot blocked by the user), so
+    // the exit status alone cannot distinguish a delivered alert from a
+    // rejected one. Reporting success here costs twice: the log line claims
+    // a delivery that never happened, and the caller records lastAlertAt,
+    // arming a 30-minute suppression window against the retry. Only
+    // transport failures (DNS, timeout) produce a non-zero status.
     if (r.status === 0) {
-      console.error('[daemon] Crash-loop alert sent to operator chat');
-      return true;
+      const body = String(r.stdout ?? '');
+      if (/"ok"\s*:\s*true/.test(body)) {
+        console.error('[daemon] Crash-loop alert sent to operator chat');
+        return true;
+      }
+      console.error(
+        '[daemon] Crash-loop alert rejected by Telegram (non-fatal): ' +
+        body.slice(0, 200),
+      );
+      return false;
     }
     console.error('[daemon] Crash-loop alert send failed (non-fatal)');
     return false;
