@@ -435,14 +435,39 @@ async function main(): Promise<void> {
   }
 
   if (message) {
+    // The send URL embeds the bot token, and fetch failure messages often
+    // quote the URL they were given. Everything logged below goes through
+    // this first so a diagnostic can never become a credential leak.
+    const redact = (s: string): string =>
+      botToken ? s.split(botToken).join('<BOT_TOKEN>') : s;
+
     try {
       const url = `https://api.telegram.org/bot${botToken}/sendMessage`;
-      await fetch(url, {
+      const res = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId, text: message }),
       });
-    } catch { /* ignore send failures */ }
+
+      // fetch resolves normally on 4xx/5xx — it rejects only on transport
+      // failure. Without this check a revoked token, a deleted bot, a user
+      // who blocked it, or chat_not_found silently discards the one alert
+      // that fires only when a session has already ended badly.
+      if (!res.ok) {
+        let detail = '';
+        try { detail = redact((await res.text()).slice(0, 200)); } catch { /* body is optional */ }
+        process.stderr.write(
+          `[crash-alert] Telegram rejected the "${endType}" alert for ${agentName}: ` +
+          `HTTP ${res.status} ${res.statusText}${detail ? ` — ${detail}` : ''}\n`
+        );
+      }
+    } catch (err) {
+      // Transport failure. Still reported, still non-fatal.
+      process.stderr.write(
+        `[crash-alert] Telegram send failed for the "${endType}" alert for ` +
+        `${agentName}: ${redact(err instanceof Error ? err.message : String(err))}\n`
+      );
+    }
   }
 }
 
