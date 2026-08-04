@@ -2567,13 +2567,26 @@ busCommand
         agent: opts.agent,
         reason: opts.reason,
       });
+      const failures = result.distributionFailures ?? [];
       if (opts.json) {
         console.log(JSON.stringify(result, null, 2));
       } else if (result.rotated) {
         console.log(`Rotated: ${result.from} → ${result.to}`);
         console.log(`Reason: ${result.reason}`);
+        for (const f of failures) {
+          console.error(`  ! ${f.agent}: ${f.error}`);
+        }
       } else {
         console.log(`No rotation needed: ${result.reason}`);
+      }
+      if (failures.length > 0) {
+        // The account rotated but these agents are STILL ON THE OLD TOKEN — the
+        // one the rotation was triggered to replace. Nothing re-syncs them until
+        // the next rotation, so this must not exit 0 and read as success.
+        console.error(
+          `Token NOT delivered to ${failures.length} agent(s); they are still using the previous token.`,
+        );
+        process.exit(1);
       }
     } catch (err) {
       console.error(`Error: ${err}`);

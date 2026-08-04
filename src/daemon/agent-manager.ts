@@ -316,6 +316,11 @@ export class AgentManager {
     let botToken: string | undefined;
 
     if (existsSync(agentEnvFile)) {
+      // Set by any branch below that both explains AND disables Telegram, so
+      // the catch-all at the end doesn't second-guess a diagnostic we already
+      // printed.
+      let telegramDiagnosed = false;
+
       // stripBom: Windows tooling writes .env with a UTF-8 BOM that breaks
       // /^BOT_TOKEN=/m when BOT_TOKEN is on line 1 (2026-05-16 silent
       // smith-not-receiving-Telegram incident). See src/utils/strip-bom.ts.
@@ -331,6 +336,7 @@ export class AgentManager {
       if (botToken && !/^\d+:[A-Za-z0-9_-]+$/.test(botToken)) {
         log(`WARNING: BOT_TOKEN format invalid (expected: 123456:ABC...). Telegram will not start.`);
         botToken = undefined;
+        telegramDiagnosed = true;
       }
 
       // ALLOWED_USER must be one or more numeric Telegram user IDs.
@@ -360,13 +366,26 @@ export class AgentManager {
           ).catch(() => {});
         }
         botToken = undefined;
+        telegramDiagnosed = true;
       }
 
       if (botToken && chatId) {
         telegramApi = new TelegramAPI(botToken);
         // Don't log sensitive user IDs — just indicate the gate is enabled
         log(`Telegram configured (chat_id: ****${String(chatId).slice(-4)}, allowed_user: enabled)`);
+      } else if (!telegramDiagnosed) {
+        // Nothing above explained it, so a key is simply absent or blank:
+        // empty .env, truncated write, partial restore, hand-edit. Without
+        // this branch the agent starts with Telegram silently disabled and
+        // no log line at all — the shape of the 2026-05-16 incident above,
+        // which reached production by a different route (a BOM) than any
+        // race. This is a log, not an alert: when the credentials are what's
+        // missing, there is no channel left to alert over.
+        const missing = [!botToken && 'BOT_TOKEN', !chatId && 'CHAT_ID'].filter(Boolean);
+        log(`WARNING: Telegram DISABLED — ${agentEnvFile} is missing ${missing.join(' and ')}. The agent will start but cannot send or receive Telegram messages.`);
       }
+    } else {
+      log(`WARNING: Telegram DISABLED — no .env file at ${agentEnvFile}. The agent will start but cannot send or receive Telegram messages.`);
     }
 
     const agentProcess = new AgentProcess(name, env, config, log);
