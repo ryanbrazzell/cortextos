@@ -82,11 +82,30 @@ export interface CheckUsageResult {
   fetched_at: string;
 }
 
+/** An agent whose .env could not be updated with the rotated token. */
+export interface AgentTokenWriteFailure {
+  /** Agent directory name, or "(all)" when no agent could be reached at all. */
+  agent: string;
+  error: string;
+}
+
 export interface RotateResult {
   rotated: boolean;
   reason: string;
   from?: string;
   to?: string;
+  /**
+   * Agents the new token could NOT be delivered to. Absent/empty means every
+   * agent received it.
+   *
+   * `rotated: true` means the ACTIVE ACCOUNT changed (accounts.json was
+   * committed) — it does NOT by itself mean the agents are running on the new
+   * token. A rotation fires because the old credential is near exhaustion, so
+   * an agent left behind here keeps burning the token the rotation replaced,
+   * and nothing re-syncs it until the next rotation. Callers must treat a
+   * non-empty list as a failure even though `rotated` is true.
+   */
+  distributionFailures?: AgentTokenWriteFailure[];
 }
 
 const CACHE_TTL_MS = 3 * 60 * 1000; // 3 minutes
@@ -186,8 +205,9 @@ function saveAccounts(ctxRoot: string, store: AccountsStore): void {
  * function throws instead of returning true, so a caller cannot distinguish
  * "committed, follow-up failed" from "committed nothing" by return value alone.
  * Treat a throw as "the commit landed, the follow-up state is unknown". No
- * current caller can reach it (writeTokenToAgents swallows every per-agent
- * error), but the contract permits it.
+ * current caller can reach it — writeTokenToAgents reports its per-agent errors
+ * by RETURNING them rather than throwing, which is load-bearing for that and
+ * not merely incidental — but the contract permits it.
  *
  * Returns false without writing when accounts.json is missing or `mutate`
  * returns false; callers decide whether that is benign or an error.
@@ -734,6 +754,13 @@ export async function rotateOAuth(
   let supersededBy: string | undefined;
   let raced = false;
   let credentialMoved = false;
+  // Assigned by the phase-2 callback below. Declared out here because
+  // `afterCommit` returns void, and it must stay a closure write rather than a
+  // return value: capturing it inside the lock is what ties the reported
+  // failures to the same distribution attempt the commit authorized. Stays
+  // empty when the commit is refused, which is correct — nothing was written,
+  // so there is nothing to have failed.
+  let distributionFailures: AgentTokenWriteFailure[] = [];
   const committed = withAccountsLock(ctxRoot, (reloaded) => {
     if (reloaded.active !== currentName) {
       supersededBy = reloaded.active;
@@ -801,10 +828,18 @@ export async function rotateOAuth(
   // takes this lock, so an agent starting up mid-distribution can still observe
   // some .env files updated and others not. And it does not make accounts.json
   // and the .env files agree in general — refreshOAuthToken commits a new
-  // access_token for an account without touching any .env, an `opts.agent`-scoped
-  // rotation updates one agent and leaves the rest, and writeTokenToAgents
-  // swallows per-agent write failures, so a rotation can report success having
-  // updated only some agents. All three survive this change untouched.
+  // access_token for an account without touching any .env, and an
+  // `opts.agent`-scoped rotation updates one agent and leaves the rest. Both
+  // survive this change untouched.
+  //
+  // A third divergence used to sit here: writeTokenToAgents swallowed per-agent
+  // write failures, so a rotation could report success having updated only some
+  // agents. It still does not throw — that is what keeps the afterCommit
+  // contract's "commit landed, follow-up unknown" case unreachable — but it now
+  // RETURNS the agents it could not reach, and rotateOAuth surfaces them as
+  // `distributionFailures`. The divergence is still possible; it is no longer
+  // silent. Note the reporting is the whole of the fix: nothing re-syncs a
+  // stranded agent, so a caller that ignores the field is back where it started.
   //
   // Cost, deliberately accepted: the lock is now held across N synchronous
   // .env writes instead of released before them. Those are microseconds against
@@ -813,7 +848,9 @@ export async function rotateOAuth(
   // throws on acquire timeout AFTER the network refresh has already spent the
   // old refresh_token. Small odds, expensive failure; worth naming rather than
   // rounding to zero.
-  () => writeTokenToAgents(frameworkRoot, org, preflightedToken, opts.agent));
+  () => {
+    distributionFailures = writeTokenToAgents(frameworkRoot, org, preflightedToken, opts.agent);
+  });
 
   if (!committed) {
     // Distinguish a lost race from a corrupted store — they need different
@@ -845,6 +882,7 @@ export async function rotateOAuth(
     reason: logEntry.reason,
     from: currentName,
     to: nextName,
+    ...(distributionFailures.length > 0 ? { distributionFailures } : {}),
   };
 }
 
@@ -865,17 +903,24 @@ function pct(v: number): string {
  * Write the bare access token to agent .env files.
  * Writes CLAUDE_CODE_OAUTH_TOKEN=<token> — bare string, not JSON.
  * Scoped to a specific agent if opts.agent is set, otherwise all agents in org.
+ *
+ * Returns the agents it could NOT write to, so the caller can report a rotation
+ * that did not actually reach its agents. One agent's failure never stops the
+ * others: every name is attempted.
  */
 function writeTokenToAgents(
   frameworkRoot: string,
   org: string,
   token: string,
   targetAgent?: string,
-): void {
+): AgentTokenWriteFailure[] {
+  const failures: AgentTokenWriteFailure[] = [];
   const agentsBase = join(frameworkRoot, 'orgs', org, 'agents');
-  if (!existsSync(agentsBase)) return;
+  if (!existsSync(agentsBase)) {
+    return [{ agent: '(all)', error: `agents directory not found: ${agentsBase}` }];
+  }
 
-  const { readdirSync, writeFileSync } = require('fs');
+  const { readdirSync } = require('fs');
 
   let agentNames: string[];
   if (targetAgent) {
@@ -885,14 +930,20 @@ function writeTokenToAgents(
       agentNames = readdirSync(agentsBase, { withFileTypes: true })
         .filter((d: { isDirectory(): boolean }) => d.isDirectory())
         .map((d: { name: string }) => d.name);
-    } catch {
-      return;
+    } catch (err) {
+      return [{ agent: '(all)', error: `could not list ${agentsBase}: ${err}` }];
     }
   }
 
   for (const name of agentNames) {
     const envPath = join(agentsBase, name, '.env');
-    if (!existsSync(envPath)) continue;
+    if (!existsSync(envPath)) {
+      // Sweeping all agents: a directory without a .env is not an agent, so this
+      // is normal and not a failure. But an explicitly REQUESTED agent with no
+      // .env is a silent no-op — the one case worth reporting.
+      if (targetAgent) failures.push({ agent: name, error: `no .env at ${envPath}` });
+      continue;
+    }
 
     try {
       let content = readFileSync(envPath, 'utf-8');
@@ -910,6 +961,11 @@ function writeTokenToAgents(
 
       atomicWriteSync(envPath, content);
       try { chmodSync(envPath, 0o600); } catch { /* ignore */ }
-    } catch { /* skip agents whose .env we can't write */ }
+    } catch (err) {
+      // Record and keep going — this agent is stranded on the OLD token.
+      failures.push({ agent: name, error: String(err) });
+    }
   }
+
+  return failures;
 }
