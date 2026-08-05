@@ -16,6 +16,9 @@ export default defineConfig({
   test: {
     globals: true,
     testTimeout: 10000,
+    // Runs before every test file. Strips ambient CTX_* so the suite does not
+    // inherit the invoking agent shell's real host paths — see the file header.
+    setupFiles: ['tests/setup/isolate-ctx-env.ts'],
     include: [
       'tests/**/*.test.ts',
       'dashboard/src/**/__tests__/**/*.test.ts',

@@ -720,7 +720,22 @@ busCommand
     if (success) {
       console.log('Activity posted');
     } else {
-      console.error('Failed to post activity. Check that ACTIVITY_CHAT_ID is set in your org secrets.env or .env file.');
+      // postActivity() reads ACTIVITY_BOT_TOKEN and ACTIVITY_CHAT_ID from
+      // activity-channel.env only — it never opens secrets.env or .env — so the
+      // remediation has to name that file and both keys, or an operator sets the
+      // right value in a file the loader will not read.
+      const configPath = orgDir
+        ? join(orgDir, 'activity-channel.env')
+        : join(env.ctxRoot, 'orgs', env.org, 'activity-channel.env');
+      // postActivity() returns false for an unconfigured channel, an unreadable
+      // config file, AND a failed send, and does not say which. So name the
+      // likeliest cause without asserting it, and account for the others.
+      console.error(
+        `Failed to post activity. Most often the channel is not configured yet: define ACTIVITY_BOT_TOKEN ` +
+          `and ACTIVITY_CHAT_ID in ${configPath} (see activity-channel.env.example). ` +
+          'They are read from activity-channel.env only — secrets.env and .env are not consulted. ' +
+          'If that file is already present and correct, the send itself failed.',
+      );
     }
   });
 
