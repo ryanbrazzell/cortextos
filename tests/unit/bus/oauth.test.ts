@@ -1481,3 +1481,177 @@ describe('alert thresholds', () => {
     expect(ALERT_7D).toBe(0.70);
   });
 });
+
+/*
+ * Regression: agent .env files grew by one byte on every rotation.
+ *
+ * atomicWriteSync unconditionally appends '\n' to whatever it is handed
+ * (src/utils/atomic.ts). writeTokenToAgents handed it content that ALREADY
+ * ended in a newline, so each rotation left one more blank line behind and
+ * nothing ever trimmed it back — unbounded growth across rotations.
+ *
+ * The assertions count TRAILING NEWLINES rather than comparing file sizes.
+ * Successive rotations write tokens of differing length, so a byte-count
+ * comparison would move for reasons that have nothing to do with this defect
+ * and would pass or fail for the wrong reason.
+ */
+describe('rotateOAuth — agent .env keeps exactly one trailing newline', () => {
+  const usageResponse = (five: number, seven: number) => ({
+    ok: true,
+    json: async () => ({ five_hour_utilization: five, seven_day_utilization: seven }),
+  });
+
+  function trailingNewlines(s: string): number {
+    const m = s.match(/\n*$/);
+    return m ? m[0].length : 0;
+  }
+
+  function makeFwRoot(envContent: string) {
+    const { mkdirSync, writeFileSync } = require('fs');
+    const fwRoot = mkdtempSync(join(tmpdir(), 'cortextos-fw-'));
+    const agentDir = join(fwRoot, 'orgs', 'acme', 'agents', 'rally-builder');
+    mkdirSync(agentDir, { recursive: true });
+    const envPath = join(agentDir, '.env');
+    writeFileSync(envPath, envContent);
+    return { fwRoot, envPath };
+  }
+
+  const HIGH_PRIMARY = {
+    ...SAMPLE_STORE,
+    accounts: {
+      ...SAMPLE_STORE.accounts,
+      primary: { ...SAMPLE_STORE.accounts.primary, five_hour_utilization: 0.90 },
+    },
+  };
+
+  it('replaces an existing token line without adding a blank line', async () => {
+    // The common case: the .env already has a token line and, like every
+    // normal text file, already ends in a newline.
+    const { fwRoot, envPath } = makeFwRoot('CLAUDE_CODE_OAUTH_TOKEN=tok_primary_abc\n');
+    try {
+      writeStore(HIGH_PRIMARY);
+      mockFetch.mockResolvedValueOnce(usageResponse(0.1, 0.05));
+
+      const result = await rotateOAuth(tmpDir, fwRoot, 'acme');
+      expect(result.rotated, `rotation was blocked with: ${result.reason}`).toBe(true);
+
+      // Exact content, not a substring: the whole defect is the trailing bytes,
+      // and a toContain() check passes just as happily with the bug present.
+      expect(readFileSync(envPath, 'utf-8')).toBe(
+        'CLAUDE_CODE_OAUTH_TOKEN=tok_secondary_def\n',
+      );
+    } finally {
+      rmSync(fwRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('appends a new token line without adding a blank line, preserving other vars', async () => {
+    // The other branch of writeTokenToAgents: no token line present yet.
+    const { fwRoot, envPath } = makeFwRoot('FOO=bar\nBAZ=qux\n');
+    try {
+      writeStore(HIGH_PRIMARY);
+      mockFetch.mockResolvedValueOnce(usageResponse(0.1, 0.05));
+
+      const result = await rotateOAuth(tmpDir, fwRoot, 'acme');
+      expect(result.rotated, `rotation was blocked with: ${result.reason}`).toBe(true);
+
+      expect(readFileSync(envPath, 'utf-8')).toBe(
+        'FOO=bar\nBAZ=qux\nCLAUDE_CODE_OAUTH_TOKEN=tok_secondary_def\n',
+      );
+    } finally {
+      rmSync(fwRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not accumulate blank lines across repeated rotations', async () => {
+    // One rotation only ever costs one byte, so a single-rotation assertion
+    // understates the claim being made here. Growth is the actual defect, and
+    // it is only observable once the file has been written more than once.
+    const withTertiary = {
+      ...HIGH_PRIMARY,
+      accounts: {
+        ...HIGH_PRIMARY.accounts,
+        tertiary: {
+          label: 'Tertiary Account',
+          access_token: 'tok_tertiary_ghi',
+          refresh_token: 'rtok_tertiary_rst',
+          expires_at: Date.now() + FOUR_HOURS_MS,
+          last_refreshed: '2026-04-05T00:00:00Z',
+          five_hour_utilization: 0.2,
+          seven_day_utilization: 0.1,
+        },
+      },
+    };
+
+    const { fwRoot, envPath } = makeFwRoot('CLAUDE_CODE_OAUTH_TOKEN=tok_primary_abc\n');
+    try {
+      writeStore(withTertiary);
+      mockFetch.mockResolvedValueOnce(usageResponse(0.1, 0.05));
+      const first = await rotateOAuth(tmpDir, fwRoot, 'acme');
+      expect(first.rotated, `first rotation was blocked with: ${first.reason}`).toBe(true);
+      expect(trailingNewlines(readFileSync(envPath, 'utf-8'))).toBe(1);
+
+      // Drive a SECOND rotation: secondary (now active) goes over threshold, so
+      // tertiary becomes the destination and the .env is rewritten again.
+      const store = loadAccounts(tmpDir)!;
+      store.accounts.secondary.five_hour_utilization = 0.90;
+      store.accounts.primary.five_hour_utilization = 0.5;
+      const { writeFileSync } = require('fs');
+      writeFileSync(accountsFile(), JSON.stringify(store, null, 2));
+
+      mockFetch.mockResolvedValueOnce(usageResponse(0.1, 0.05));
+      const second = await rotateOAuth(tmpDir, fwRoot, 'acme');
+      expect(second.rotated, `second rotation was blocked with: ${second.reason}`).toBe(true);
+
+      const after = readFileSync(envPath, 'utf-8');
+      // With the defect this is 3 after two rotations, and keeps climbing.
+      expect(trailingNewlines(after)).toBe(1);
+      expect(after).toBe('CLAUDE_CODE_OAUTH_TOKEN=tok_tertiary_ghi\n');
+    } finally {
+      rmSync(fwRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+/*
+ * The narrowing arm. The obvious spelling of the fix above is
+ * `content.trimEnd()`, which also strips spaces and tabs off the last
+ * variable's value — a wider change than the defect warrants, and on a CRLF
+ * file it eats the \r and rewrites that line's ending too. Every assertion in
+ * the block above passes just as well with trimEnd(), so without this test
+ * nothing stops a later refactor from quietly widening the fix back out.
+ */
+describe('rotateOAuth — token distribution touches nothing but the trailing newline', () => {
+  it('leaves trailing whitespace on an unrelated final line alone', async () => {
+    const { mkdirSync, writeFileSync } = require('fs');
+    const fwRoot = mkdtempSync(join(tmpdir(), 'cortextos-fw-'));
+    const agentDir = join(fwRoot, 'orgs', 'acme', 'agents', 'rally-builder');
+    mkdirSync(agentDir, { recursive: true });
+    const envPath = join(agentDir, '.env');
+    // Trailing spaces on the LAST line, which is not the token line.
+    writeFileSync(envPath, 'CLAUDE_CODE_OAUTH_TOKEN=tok_primary_abc\nOTHER=keep me   \n');
+
+    try {
+      writeStore({
+        ...SAMPLE_STORE,
+        accounts: {
+          ...SAMPLE_STORE.accounts,
+          primary: { ...SAMPLE_STORE.accounts.primary, five_hour_utilization: 0.90 },
+        },
+      });
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ five_hour_utilization: 0.1, seven_day_utilization: 0.05 }),
+      });
+
+      const result = await rotateOAuth(tmpDir, fwRoot, 'acme');
+      expect(result.rotated, `rotation was blocked with: ${result.reason}`).toBe(true);
+
+      expect(readFileSync(envPath, 'utf-8')).toBe(
+        'CLAUDE_CODE_OAUTH_TOKEN=tok_secondary_def\nOTHER=keep me   \n',
+      );
+    } finally {
+      rmSync(fwRoot, { recursive: true, force: true });
+    }
+  });
+});
