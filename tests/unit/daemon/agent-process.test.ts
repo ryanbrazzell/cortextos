@@ -48,6 +48,15 @@ const fsMocks = {
   writeFileSync: vi.fn(),
   appendFileSync: vi.fn(),
   statSync: vi.fn(),
+  // Mocked so consumeHandoffBlock's marker unlink does not fall through to real fs.
+  // Unmocked it throws ENOENT on the fake /tmp/test-ctx paths, which consumeHandoffBlock
+  // swallows — silently emptying the handoff block and making every handoff-branch
+  // assertion below vacuously pass.
+  unlinkSync: vi.fn(),
+  // Defaults to [] so shouldContinue()'s JSONL probe reports "no history" (the prior
+  // behavior when this went to real fs on nonexistent /tmp paths). The --continue test
+  // overrides it to select continue mode.
+  readdirSync: vi.fn(() => [] as string[]),
 };
 
 vi.mock('fs', async () => {
@@ -76,6 +85,8 @@ vi.mock('fs', async () => {
     get writeFileSync() { return fsMocks.writeFileSync; },
     get appendFileSync() { return fsMocks.appendFileSync; },
     get statSync() { return fsMocks.statSync; },
+    get unlinkSync() { return fsMocks.unlinkSync; },
+    get readdirSync() { return fsMocks.readdirSync; },
   };
 });
 
@@ -464,5 +475,179 @@ describe('AgentProcess - onboarding marker (do not auto-write .onboarded on hear
     const prompt = mockPty.spawn.mock.calls[0]?.[1] ?? '';
     expect(prompt).not.toContain('FIRST BOOT');
     expect(prompt).not.toContain('complete the onboarding protocol');
+  });
+});
+
+describe('AgentProcess — boot announce gated on restart reason (.restart-planned)', () => {
+  // 332 restarts over 11 days on the reference host were ALL planned and ZERO were
+  // crashes, so the ungated announce was ~100% false-positive by volume.
+  //
+  // There are TWO mutually-exclusive announce branches in buildStartupPrompt, and the
+  // handoff one carries ~96% of real traffic (318/332 restarts are context handoffs).
+  // Gating only `onlineMessage` covers the 4% while looking like a fix, so each branch
+  // is asserted separately below.
+  const HANDOFF_DOC = '/tmp/handoff.md';
+  const SEND_MANDATE = 'VERY FIRST tool call';
+  const STEP_ONE_SUPPRESSION = 'Do NOT send "Booting up... one moment"';
+  const COLD_BOOT_ANNOUNCE = 'saying you are back online';
+
+  /** @param plannedAgeMs age of .restart-planned, or null for "no marker at all" */
+  function setupFs(opts: { handoff: boolean; plannedAgeMs: number | null }) {
+    fsMocks.existsSync.mockImplementation((path: string) => {
+      if (path.endsWith('/.force-fresh')) return false;
+      if (path.endsWith('/.onboarded')) return true;
+      if (path.endsWith('/.handoff-doc-path')) return opts.handoff;
+      if (path.endsWith('/.restart-planned')) return opts.plannedAgeMs !== null;
+      if (path === HANDOFF_DOC) return true;
+      return false;
+    });
+    fsMocks.readFileSync.mockImplementation((path: string) =>
+      path.endsWith('/.handoff-doc-path') ? HANDOFF_DOC : '',
+    );
+    fsMocks.statSync.mockImplementation(() => ({
+      mtimeMs: Date.now() - (opts.plannedAgeMs ?? 0),
+    }));
+  }
+
+  // Every negative assertion below is `not.toContain`, which passes trivially on ''.
+  // `spawn.mock.calls[0]?.[1] ?? ''` yields '' whenever spawn did not happen, so a
+  // broken setup would make the suppression tests pass for the wrong reason. Assert the
+  // prompt was really built and carries a stable sentinel before returning it.
+  function assertRealPrompt(prompt: string) {
+    expect(mockPty.spawn).toHaveBeenCalledTimes(1);
+    expect(prompt).toContain('You are starting a new session');
+    return prompt;
+  }
+
+  async function promptFor(opts: { handoff: boolean; plannedAgeMs: number | null }) {
+    setupFs(opts);
+    const ap = new AgentProcess('alice', mockEnv, {});
+    ap.setTelegramHandle({} as never, '12345');
+    await ap.start();
+    return assertRealPrompt(mockPty.spawn.mock.calls[0]?.[1] ?? '');
+  }
+
+  it('handoff + planned restart: suppresses the ping but KEEPS the step-1 suppression', async () => {
+    const prompt = await promptFor({ handoff: true, plannedAgeMs: 1_000 });
+
+    // Control arm: prove we are on the handoff branch at all, so the negative
+    // assertion below cannot pass merely because the block is missing entirely.
+    expect(prompt).toContain('HANDOFF UX');
+    expect(prompt).toContain('memory is intact via the handoff doc');
+
+    expect(prompt).not.toContain(SEND_MANDATE);
+    expect(prompt).not.toContain('send-telegram');
+
+    // THE REGRESSION GUARD. Gating the whole block off drops this clause, and
+    // AGENTS.md:26 / CLAUDE.md:22 then unconditionally tell the fresh session to send
+    // 'Booting up... one moment' — trading the ping for a worse, cold-boot one.
+    expect(prompt).toContain(STEP_ONE_SUPPRESSION);
+  });
+
+  it('handoff + UNplanned restart: still sends the pickup ping', async () => {
+    const prompt = await promptFor({ handoff: true, plannedAgeMs: null });
+    expect(prompt).toContain(SEND_MANDATE);
+    expect(prompt).toContain('send-telegram');
+    expect(prompt).toContain(STEP_ONE_SUPPRESSION);
+  });
+
+  it('handoff + STALE marker: treats it as unplanned and announces (TTL backstop)', async () => {
+    // A start that dies before its first heartbeat never runs clearEndMarkers, so the
+    // marker outlives its restart. Without the TTL it would suppress the announce for
+    // every later restart, including a genuine crash.
+    const prompt = await promptFor({ handoff: true, plannedAgeMs: 300_001 });
+    expect(prompt).toContain(SEND_MANDATE);
+  });
+
+  it('cold boot + planned restart: no "back online" announce', async () => {
+    const prompt = await promptFor({ handoff: false, plannedAgeMs: 1_000 });
+    expect(prompt).not.toContain(COLD_BOOT_ANNOUNCE);
+    expect(prompt).not.toContain('HANDOFF UX');
+  });
+
+  it('cold boot + UNplanned restart: announces (a real crash must still be heard)', async () => {
+    const prompt = await promptFor({ handoff: false, plannedAgeMs: null });
+    expect(prompt).toContain(COLD_BOOT_ANNOUNCE);
+  });
+
+  it('fails OPEN toward announcing when the marker mtime is unreadable', async () => {
+    setupFs({ handoff: false, plannedAgeMs: 1_000 });
+    fsMocks.statSync.mockImplementation(() => { throw new Error('EIO'); });
+    const ap = new AgentProcess('alice', mockEnv, {});
+    ap.setTelegramHandle({} as never, '12345');
+    await ap.start();
+    const prompt = mockPty.spawn.mock.calls[0]?.[1] ?? '';
+    expect(prompt).toContain(COLD_BOOT_ANNOUNCE);
+  });
+
+  it('a CRASH following a planned restart still announces (marker is stale-but-fresh)', async () => {
+    // The hole marker-only logic would leave open: clearEndMarkers needs a heartbeat
+    // past its 120s grace to remove .restart-planned, so a session that dies before
+    // then leaves a marker that still passes the TTL. Marker alone => a genuine crash
+    // reads as planned and stays silent, for up to 5 minutes after EVERY restart.
+    setupFs({ handoff: false, plannedAgeMs: 1_000 });
+    const ap = new AgentProcess('alice', mockEnv, {});
+    ap.setTelegramHandle({} as never, '12345');
+    await ap.start();
+
+    // Control arm: the planned restart itself is correctly silent.
+    expect(mockPty.spawn.mock.calls[0]?.[1] ?? '').not.toContain(COLD_BOOT_ANNOUNCE);
+
+    // Now crash it — unintentional exit, no stop() requested.
+    mockPty.spawn.mockClear();
+    capturedOnExit?.(1);
+    await ap.start();
+
+    const prompt = mockPty.spawn.mock.calls[0]?.[1] ?? '';
+    expect(prompt).toContain(COLD_BOOT_ANNOUNCE);
+  });
+
+  it('does not announce at all when Telegram is not wired up', async () => {
+    setupFs({ handoff: false, plannedAgeMs: null });
+    const ap = new AgentProcess('alice', mockEnv, {}); // no setTelegramHandle
+    await ap.start();
+    const prompt = assertRealPrompt(mockPty.spawn.mock.calls[0]?.[1] ?? '');
+    expect(prompt).not.toContain(COLD_BOOT_ANNOUNCE);
+  });
+
+  it('a future-stamped marker does NOT suppress (negative age is rejected)', async () => {
+    // `ageMs <= TTL` alone accepts every negative age, so a marker stamped in the future
+    // — clock correction, restored fs metadata, volume skew — would suppress announces
+    // until wall time caught up.
+    const prompt = await promptFor({ handoff: false, plannedAgeMs: -3_600_000 });
+    expect(prompt).toContain(COLD_BOOT_ANNOUNCE);
+  });
+
+  it('suppresses exactly AT the TTL boundary and announces just past it', async () => {
+    expect(await promptFor({ handoff: false, plannedAgeMs: 300_000 }))
+      .not.toContain(COLD_BOOT_ANNOUNCE);
+    mockPty.spawn.mockClear();
+    expect(await promptFor({ handoff: false, plannedAgeMs: 300_001 }))
+      .toContain(COLD_BOOT_ANNOUNCE);
+  });
+
+  it('--continue refresh is gated on the same seam', async () => {
+    // buildContinuePrompt is a separate production behavior change and needs its own
+    // coverage, not inheritance from the startup-path tests.
+    setupFs({ handoff: false, plannedAgeMs: 1_000 });
+    fsMocks.existsSync.mockImplementation((path: string) => {
+      if (path.endsWith('/.restart-planned')) return true;
+      if (path.endsWith('/.onboarded')) return true;
+      return false;
+    });
+    const ap = new AgentProcess('alice', mockEnv, {});
+    ap.setTelegramHandle({} as never, '12345');
+    // Select continue mode directly. shouldContinue() probes the Claude projects dir via
+    // `require('fs').readdirSync`, which the ESM `vi.mock('fs')` above does not intercept,
+    // so the marker-based setup cannot reach this branch. Stubbing the branch SELECTOR is
+    // safe here — the gate under test (shouldAnnounceOnBoot) is untouched and still runs
+    // for real against the .restart-planned marker set above.
+    vi.spyOn(ap as never, 'shouldContinue').mockReturnValue(true as never);
+    await ap.start();
+
+    const prompt = mockPty.spawn.mock.calls[0]?.[1] ?? '';
+    expect(mockPty.spawn).toHaveBeenCalledTimes(1);
+    expect(prompt).toContain('SESSION CONTINUATION');
+    expect(prompt).not.toContain(COLD_BOOT_ANNOUNCE);
   });
 });
