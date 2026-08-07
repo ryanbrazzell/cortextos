@@ -69,6 +69,18 @@ export class AgentProcess {
   // a handoff doc marker. start() reads this after spawn to decide whether the
   // daemon should fire runtime-owned lifecycle Telegram directly.
   private lastSpawnWasHandoff = false;
+  // Set by handleExit when an exit is classified as a genuine crash; consumed by the
+  // next start(). Outranks the `.restart-planned` marker when deciding whether a boot
+  // should announce itself — see isPlannedRestart(). Lost if the whole daemon restarts,
+  // which is why the marker remains as the fallback.
+  private lastExitWasCrash = false;
+  // Set by sessionRefresh() before it tears the PTY down; consumed by the next start().
+  // The session-time-cap rollover is daemon-scheduled, so the boot that follows it is
+  // planned — but unlike self-restart/hard-restart it writes no `.restart-planned`, so
+  // the marker cannot see it. This flag is how that path declares itself: same shape as
+  // lastExitWasCrash, opposite sense. Ranked BELOW the crash flag in isPlannedRestart()
+  // so a genuine crash still announces even if a refresh left this set.
+  private plannedSessionRefresh = false;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -111,6 +123,12 @@ export class AgentProcess {
     const prompt = mode === 'fresh'
       ? this.buildStartupPrompt()
       : this.buildContinuePrompt();
+    // One-shot: the announce decision for this start has now been made, so a later
+    // PLANNED restart is not treated as a crash just because an older one was.
+    this.lastExitWasCrash = false;
+    // Same one-shot discipline in the opposite direction: a refresh suppresses exactly
+    // the boot it caused, never the next one.
+    this.plannedSessionRefresh = false;
 
     this.log(`Starting in ${mode} mode`);
     this.status = 'starting';
@@ -302,6 +320,12 @@ export class AgentProcess {
    */
   async sessionRefresh(): Promise<void> {
     this.log('Session refresh (--continue restart)');
+    // Declare this restart planned BEFORE tearing the PTY down, so the boot prompt built
+    // inside the start() below suppresses its 'back online' announce. Must be set here
+    // rather than derived at prompt time: this path writes no `.restart-planned`, and the
+    // `.session-refresh` marker written just below is the HOOK's channel — reusing it here
+    // would couple two consumers with different lifetimes to one file.
+    this.plannedSessionRefresh = true;
     // Write .session-refresh marker so the SessionEnd crash-alert hook
     // (src/hooks/hook-crash-alert.ts) classifies the imminent PTY exit as a
     // session refresh rather than a crash. The hook's marker handler +
@@ -555,6 +579,19 @@ export class AgentProcess {
       return;
     }
 
+    // Past this point the exit is a genuine crash: every intentional-exit path
+    // (stop request, daemon shutdown) has returned above. Record it so the next
+    // buildStartupPrompt announces even if a `.restart-planned` marker is still on
+    // disk from the PLANNED restart that preceded this crash.
+    //
+    // Without this the gate has a real hole: clearEndMarkers only clears the marker on
+    // the first post-restart heartbeat past its 120s grace, so a session that dies
+    // before then leaves a marker that is still "fresh" by the TTL — and the crash
+    // restart reads it as planned and stays silent. This flag is the authoritative
+    // signal (in-process, derived from the exit itself) and the marker is only the
+    // fallback for when it is unavailable.
+    this.lastExitWasCrash = true;
+
     // Image-poison auto-recovery (companion to PR #446's photo-injection fix).
     // Checked FIRST so a poisoned-context crash neither trips the crash-loop
     // window nor charges the daily counter — it is an upstream artifact, not
@@ -729,14 +766,45 @@ export class AgentProcess {
     // HANDOFF UX: the pickup message MUST be the first action after reading the handoff doc —
     // before cron restoration, before heartbeat, before anything else. Placing this instruction
     // immediately after the handoffBlock in the prompt ensures it is not buried.
-    const shouldPromptTelegram = this.shouldPromptTelegramOnlineMessage();
-    const handoffUxOverride = isHandoffRestart && shouldPromptTelegram
-      ? ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc. CRITICAL: After reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. Do this BEFORE running heartbeat, BEFORE any other tool call. No cron IDs, no status report, no cold-boot phrasing. Do NOT send "Booting up... one moment" (skip AGENTS.md step 1 entirely).'
+    //
+    // The clauses are assembled SEPARATELY on purpose, because they have three different
+    // gates. Emitting them as one blob is what made the pre-fix version wrong:
+    //   intro              — every handoff restart, announce or not.
+    //   sendMandate        — only when we actually want the owner pinged.
+    //   stepOneSuppression — every PLANNED restart, handoff or not (see below).
+    // Gating the whole block on the announce decision drops the step-1 suppression too,
+    // and AGENTS.md:26 / CLAUDE.md:22 then unconditionally instruct the fresh session to
+    // send 'Booting up... one moment'. That trades one message for a WORSE one — a
+    // cold-boot ping in place of an informative one. Keep the clauses separate.
+    const shouldAnnounce = this.shouldAnnounceOnBoot();
+    const isPlanned = this.isPlannedRestart();
+    const handoffUxOverride = isHandoffRestart
+      ? ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc.'
+        + (shouldAnnounce
+          ? ' CRITICAL: After reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. Do this BEFORE running heartbeat, BEFORE any other tool call. No cron IDs, no status report, no cold-boot phrasing.'
+          : '')
       : '';
-    const onlineMessage = isHandoffRestart || !shouldPromptTelegram
+    // Suppressing the agent's OWN step-1 boot message is a separate decision from
+    // suppressing the daemon-injected announce, and it belongs to ALL planned restarts —
+    // handoff (~96% of traffic) and non-handoff alike. Scoping it to the handoff branch
+    // left the non-handoff planned path (~4%) carrying NEITHER clause, so the fresh
+    // session read AGENTS.md:26 and pinged 'Booting up... one moment' anyway.
+    //
+    // Gated on isPlannedRestart(), NOT on `!shouldAnnounce`. Those differ: shouldAnnounce
+    // is also false when Telegram is simply not wired up, and an UNPLANNED cold boot on
+    // such a host must not be told to skip step 1 — it is a real cold boot, and the
+    // instruction would be suppressed for a reason that has nothing to do with intent.
+    //
+    // `isHandoffRestart ||` is retained rather than folded in: a handoff doc on disk is
+    // itself proof the restart was deliberate, and it survives the daemon restarting out
+    // from under the in-process flags when the marker cannot.
+    const stepOneSuppression = isHandoffRestart || isPlanned
+      ? ' Do NOT send "Booting up... one moment" (skip AGENTS.md step 1 entirely).'
+      : '';
+    const onlineMessage = isHandoffRestart || !shouldAnnounce
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
-    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
+    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${stepOneSuppression}${onlineMessage}${onboardingAppend}`;
   }
 
   private buildContinuePrompt(): string {
@@ -745,7 +813,17 @@ export class AgentProcess {
     const deliverablesBlock = this.buildDeliverablesBlock();
     // Session refresh (--continue) is never a handoff restart.
     this.lastSpawnWasHandoff = false;
-    const onlineMessage = this.shouldPromptTelegramOnlineMessage()
+    // Gated on the same seam as the startup path. This builder is reachable two ways,
+    // and the gate now fires on both:
+    //   1. the session timer firing at max_session_seconds (~71h) -> sessionRefresh().
+    //      That path writes NO `.restart-planned`, so the marker cannot see it; it
+    //      declares itself planned via plannedSessionRefresh instead. Suppressed.
+    //   2. a daemon start that finds conversation history and no `.force-fresh`
+    //      (operator restart, host reboot). Neither signal is set, so it announces —
+    //      correct, since nothing scheduled it.
+    // forceContextRestart does NOT reach here — it writes `.force-fresh`, so
+    // shouldContinue() is false and it routes to buildStartupPrompt instead.
+    const onlineMessage = this.shouldAnnounceOnBoot()
       ? ' After checking inbox, send a Telegram message to the user saying you are back online.'
       : '';
     return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations.${onlineMessage}`;
@@ -753,6 +831,82 @@ export class AgentProcess {
 
   private shouldPromptTelegramOnlineMessage(): boolean {
     return this.config.telegram_polling !== false && !!this.telegramApi && !!this.telegramChatId;
+  }
+
+  /**
+   * Upper bound on how long a `.restart-planned` marker is accepted as evidence.
+   *
+   * This is a BACKSTOP against an abandoned marker, not a claim that a marker younger
+   * than this belongs to the current boot — mtime cannot establish that. The marker
+   * records INTENT, not identity: it says "a restart was requested", not "this specific
+   * process start is that restart". The crash flag in isPlannedRestart() is what carries
+   * attribution; the TTL only bounds the damage when that flag is unavailable (e.g. the
+   * whole daemon restarted, so in-process state was lost).
+   *
+   * Value matches MARKER_TTL_MS in hook-crash-alert.ts for consistency across the two
+   * channels. Note that agreement is a convenience, NOT evidence the windows are
+   * equally safe — the two make different decisions at different lifecycle points.
+   *
+   * Consuming the marker here (unlink-on-read, as consumeHandoffBlock does) would give
+   * true single-use attribution and was considered, but is NOT safe: hook-crash-alert.ts
+   * :286 also reads this marker to classify planned-restart, and the daemon/hook ordering
+   * is not guaranteed. Consuming it first would make the hook fall through to its
+   * absence-fallback and report every planned restart as a crash — strictly worse.
+   */
+  private static readonly PLANNED_RESTART_TTL_MS = 300_000; // 5 minutes
+
+  /**
+   * True when this start follows a restart the system itself scheduled — `bus
+   * self-restart` / `hard-restart` (src/bus/system.ts:64,86) or the context watchdog
+   * (fast-checker.ts:1447, which routes through hardRestart). Those writers put the
+   * reason in `.restart-planned` BEFORE the restart, so it is on disk by the time this
+   * prompt is composed; agent-process.ts:885 already reads the same marker at spawn for
+   * the codex path, so the read is proven viable at this point in the lifecycle.
+   *
+   * Fails toward FALSE (i.e. toward announcing) on every uncertainty — absent marker,
+   * unreadable mtime, any throw. A spurious ping is noise; a swallowed crash notice is
+   * the failure that actually costs something. Note this is the opposite default from
+   * the hook's unreadable-mtime branch, because the decisions are opposite in polarity:
+   * the hook is deciding whether to SEND an alert, this is deciding whether to SUPPRESS
+   * one. Both fail toward the owner hearing about it.
+   */
+  private isPlannedRestart(): boolean {
+    // The in-process crash flag outranks the marker. A crash that FOLLOWS a planned
+    // restart leaves the planned marker on disk (clearEndMarkers needs a heartbeat past
+    // its 120s grace to clear it), so marker-only logic would read a genuine crash as
+    // planned and stay silent for up to PLANNED_RESTART_TTL_MS after every restart.
+    if (this.lastExitWasCrash) return false;
+    // The session-time-cap rollover is planned but marker-less — see plannedSessionRefresh.
+    // Checked after the crash flag so the crash still wins, and before the marker read
+    // because there is no marker to find on this path.
+    if (this.plannedSessionRefresh) return true;
+    try {
+      const markerPath = join(this.env.ctxRoot, 'state', this.name, '.restart-planned');
+      if (!existsSync(markerPath)) return false;
+      const ageMs = Date.now() - statSync(markerPath).mtimeMs;
+      // A NEGATIVE age means the marker is stamped in the future — clock correction,
+      // restored fs metadata, or host/volume skew. `ageMs <= TTL` alone accepts every
+      // negative value, so a future-stamped marker would suppress announces until wall
+      // time caught up, potentially for hours. Reject it and fall through to announcing.
+      return ageMs >= 0 && ageMs <= AgentProcess.PLANNED_RESTART_TTL_MS;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Whether a boot should actually announce itself to the owner over Telegram.
+   *
+   * Deliberately distinct from shouldPromptTelegramOnlineMessage(), which is a pure
+   * CAPABILITY check (is Telegram wired up at all). Callers that must notify regardless
+   * of boot-noise policy — crash alerts, lifecycle notifications — should keep using the
+   * capability check and must not silently inherit this suppression.
+   *
+   * 332 restarts over 11 days on this host were ALL planned and ZERO were crashes, so
+   * the ungated announce was ~100% false-positive by volume.
+   */
+  private shouldAnnounceOnBoot(): boolean {
+    return this.shouldPromptTelegramOnlineMessage() && !this.isPlannedRestart();
   }
 
   /**

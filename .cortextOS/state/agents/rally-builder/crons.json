@@ -1,0 +1,26 @@
+{
+  "updated_at": "2026-08-02T21:10:44.038Z",
+  "crons": [
+    {
+      "name": "nightly-review-sbc-edge",
+      "prompt": "NIGHTLY REVIEW - sbc-edge. Work autonomously; Ryan is asleep.\n\nRepo: github.com/ryanbrazzell/sbc-edge (TypeScript, Cloudflare Workers/DO/D1, iMessage + Instagram sales bot). PRODUCTION - it messages real prospects. It has NO tests and NO CI, so you are the only safety net.\n\n1. Clone fresh (or pull) into your own working dir. Review what changed in the last 24h (git log). If nothing changed, do a rotating deep review of one subsystem instead and say which.\n2. Hunt real bugs, priority order: (a) anything that could send a wrong/duplicate/no message to a real prospect, (b) data loss or D1/DO state corruption, (c) unhandled failures on external APIs, (d) secrets or PII in logs, (e) silent failures that swallow errors.\n3. Adversarial pass with Codex: codex exec -m gpt-5.6-sol -s read-only. Verify every finding against actual code - no speculation.\n4. For fixes that are clearly safe and well-understood: make them on a branch named nightly/review-YYYY-MM-DD and OPEN A PULL REQUEST. Never push to main. Never deploy. If a fix is risky or ambiguous, describe it in the PR body instead of making it.\n5. Where you find untested critical paths, add tests - this repo needs them.\n6. Report to Ryan on Telegram by morning: what you reviewed, what you found ranked by severity, PR link if opened. If you found nothing real, say so plainly - do not pad.\n\nKeep it to one PR per night. Quality over volume.",
+      "schedule": "0 9 * * *",
+      "enabled": true,
+      "created_at": "2026-07-28T05:00:09.173Z"
+    },
+    {
+      "name": "heartbeat",
+      "prompt": "Read HEARTBEAT.md and follow its instructions. Update your heartbeat, check inbox, and work on your highest priority task.",
+      "schedule": "4h",
+      "enabled": true,
+      "created_at": "2026-07-28T05:04:20.019Z"
+    },
+    {
+      "name": "backlog-burn",
+      "prompt": "BACKLOG BURN - nightly queue work session. Ryan is offline; work autonomously. Your task queue has a large pending backlog that you filed but have not worked. Tonight: (1) List pending tasks assigned to you, sorted by priority and unblocked first (respect dependencies). (2) Triage the top of the queue: cancel anything obsolete or duplicate (say why in the task note). (3) Pick the top 5 actionable ones and COMPLETE them end to end per the Build Protocol - independent tasks may run in parallel via spawn-worker, each worker in its own clone/worktree so they never collide. (4) PRs per doctrine - never push to main. (5) Log per-task completion notes, and report the net queue change (filed vs closed) in one line to the orchestrator for Ryan's morning briefing. Quality bar unchanged: verified and reviewed, or it is not done. If a task is too big for one night, split it and finish the first piece.",
+      "schedule": "0 6 * * *",
+      "enabled": true,
+      "created_at": "2026-08-02T21:10:44.037Z"
+    }
+  ]
+}

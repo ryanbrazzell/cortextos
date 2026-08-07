@@ -8,7 +8,7 @@ vi.mock('child_process', () => ({
   execFile: (...args: unknown[]) => execFileMock(...args),
 }));
 
-import { readMaxCrashesPerDay, notifyAgents, classifyFromMarkers } from '../../../src/hooks/hook-crash-alert';
+import { readMaxCrashesPerDay, notifyAgents, classifyFromMarkers, shouldSuppressAlert, notifyPriorityFor, ENDED_WITHOUT_MARKER } from '../../../src/hooks/hook-crash-alert';
 import { clearEndMarkers } from '../../../src/bus/heartbeat';
 
 describe('readMaxCrashesPerDay', () => {
@@ -84,6 +84,59 @@ describe('notifyAgents', () => {
     expect(args.slice(0, 4)).toEqual(['bus', 'send-message', 'chief', 'high']);
   });
 
+  it('sends ended-without-marker at LOW priority, not high', () => {
+    // The demotion, at the layer that actually reaches chief/analyst. Keeping
+    // this at 'high' is what paged two agents on 3/3 false positives.
+    notifyAgents({
+      agentName: 'dev',
+      endType: ENDED_WITHOUT_MARKER,
+      reason: '',
+      lastTask: 't',
+      crashCount: 1,
+      restartAttempted: true,
+      recipients: ['chief'],
+      priority: 'low',
+    });
+    const args = execFileMock.mock.calls[0][1];
+    expect(args.slice(0, 4)).toEqual(['bus', 'send-message', 'chief', 'low']);
+  });
+
+  it('CONTROL: daemon-crashed still goes out at high priority', () => {
+    // The over-fix is to demote the whole notify path. daemon-crashed is
+    // positive evidence and must keep its urgency; only this arm catches that.
+    notifyAgents({
+      agentName: 'dev',
+      endType: 'daemon-crashed',
+      reason: 'uncaught',
+      lastTask: 't',
+      crashCount: 1,
+      restartAttempted: true,
+      recipients: ['chief'],
+      priority: 'high',
+    });
+    const args = execFileMock.mock.calls[0][1];
+    expect(args.slice(0, 4)).toEqual(['bus', 'send-message', 'chief', 'high']);
+  });
+
+  it('ended-without-marker body does not assert the agent crashed', () => {
+    // The body used to open "agent=<name> crashed", which is the claim the whole
+    // finding refutes — chief/analyst read that as a confirmed death.
+    notifyAgents({
+      agentName: 'dev',
+      endType: ENDED_WITHOUT_MARKER,
+      reason: '',
+      lastTask: 'idle',
+      crashCount: 1,
+      restartAttempted: true,
+      recipients: ['chief'],
+      priority: 'low',
+    });
+    const body: string = execFileMock.mock.calls[0][1][4];
+    expect(body).not.toContain('dev crashed');
+    expect(body).toContain('no restart marker');
+    expect(body).toContain('NOT a confirmed crash');
+  });
+
   it('body includes all required fields', () => {
     notifyAgents({
       agentName: 'dev',
@@ -147,6 +200,25 @@ describe('notifyAgents', () => {
   });
 });
 
+describe('notifyPriorityFor', () => {
+  it('demotes ended-without-marker to low', () => {
+    expect(notifyPriorityFor(ENDED_WITHOUT_MARKER)).toBe('low');
+  });
+
+  it('CONTROL: daemon-crashed stays high — positive evidence still pages', () => {
+    // The over-fix is a blanket demotion of the notify path. This is the only
+    // arm that separates "demote the absence" from "demote everything".
+    expect(notifyPriorityFor('daemon-crashed')).toBe('high');
+  });
+
+  it('CONTROL: an unrecognised end type defaults to high, not low', () => {
+    // Polarity: the notify path decides whether humans hear about it, so an
+    // unknown type must fail toward loud. A `=== 'daemon-crashed' ? high : low`
+    // inversion would pass both tests above and only this one catches it.
+    expect(notifyPriorityFor('something-new')).toBe('high');
+  });
+});
+
 describe('classifyFromMarkers', () => {
   let tmp: string;
   const MARKERS = [
@@ -164,8 +236,17 @@ describe('classifyFromMarkers', () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  it('no marker present → endType crash', () => {
-    expect(classifyFromMarkers(tmp, MARKERS).endType).toBe('crash');
+  it('no marker present → endType ended-without-marker (an absence, not a detection)', () => {
+    expect(classifyFromMarkers(tmp, MARKERS).endType).toBe(ENDED_WITHOUT_MARKER);
+  });
+
+  it('the fallback is NOT labelled "crash" — a SessionEnd hook cannot observe one', () => {
+    // Pins the rename against regression. SIGKILL/SIGTERM do not fire SessionEnd
+    // at all (verified live in both headless and PTY shapes), so reaching this
+    // branch can never mean the process died. Asserting the literal keeps a
+    // future edit from quietly restoring the old claim.
+    expect(classifyFromMarkers(tmp, MARKERS).endType).not.toBe('crash');
+    expect(ENDED_WITHOUT_MARKER).toBe('ended-without-marker');
   });
 
   it('fresh marker → classified by type, with its reason', () => {
@@ -192,7 +273,7 @@ describe('classifyFromMarkers', () => {
     // start): classify with a "now" well past the 5-minute TTL.
     const farFuture = Date.now() + 10 * 60 * 1000;
     const r = classifyFromMarkers(tmp, MARKERS, farFuture);
-    expect(r.endType).toBe('crash'); // stale marker must NOT mask a real crash
+    expect(r.endType).toBe(ENDED_WITHOUT_MARKER); // stale marker must NOT mask an unmarked end
     expect(existsSync(markerPath)).toBe(false); // lazy-unlinked
   });
 
@@ -251,7 +332,7 @@ describe('marker lifecycle (classify → clearEndMarkers → classify)', () => {
     rmSync(tmp, { recursive: true, force: true });
   });
 
-  it('both restart firings classify, a post-grace heartbeat clears, then a real crash classifies as crash', () => {
+  it('both restart firings classify, a post-grace heartbeat clears, then an unmarked end falls through', () => {
     writeFileSync(join(tmp, '.restart-planned'), 'planned reboot', 'utf-8');
     // Firing #1 and #2 of the dying restart — both must see the marker.
     expect(classifyFromMarkers(tmp, MARKERS).endType).toBe('planned-restart');
@@ -259,8 +340,10 @@ describe('marker lifecycle (classify → clearEndMarkers → classify)', () => {
     // Post-restart session heartbeats past the grace window → marker cleared.
     clearEndMarkers(tmp, Date.now() + 10 * 60 * 1000);
     expect(existsSync(join(tmp, '.restart-planned'))).toBe(false);
-    // A genuine crash AFTER the clear must classify as crash — not be masked.
-    expect(classifyFromMarkers(tmp, MARKERS).endType).toBe('crash');
+    // An unmarked end AFTER the clear must fall through, not be masked by the
+    // consumed marker. (Renamed from "a genuine crash": the clear is what this
+    // asserts — the fallback itself never evidences a crash.)
+    expect(classifyFromMarkers(tmp, MARKERS).endType).toBe(ENDED_WITHOUT_MARKER);
   });
 
   it('a heartbeat DURING the in-flight restart (within grace) does NOT wipe the marker — firing#2 still classifies', () => {
@@ -271,5 +354,84 @@ describe('marker lifecycle (classify → clearEndMarkers → classify)', () => {
     clearEndMarkers(tmp); // successor's first heartbeat — marker still within grace
     expect(existsSync(join(tmp, '.session-refresh'))).toBe(true);
     expect(classifyFromMarkers(tmp, MARKERS).endType).toBe('session-refresh'); // firing #2 — no false crash
+  });
+});
+
+describe('shouldSuppressAlert', () => {
+  // Fixed instants, chosen in America/Los_Angeles terms and expressed in UTC so the
+  // assertions do not depend on the host zone. LA is UTC-7 in August (PDT).
+  const DAYTIME_LA = new Date('2026-08-07T21:00:00Z'); // 14:00 LA — outside quiet hours
+  const NIGHT_LA = new Date('2026-08-07T09:00:00Z');   // 02:00 LA — inside quiet hours
+
+  it('the quiet-hours fixtures really are on opposite sides of the boundary', () => {
+    // Guards the two constants above. If a zone/DST assumption drifted so that both
+    // landed on the same side, every "around the clock" assertion below would still
+    // pass while proving nothing about time-of-day at all.
+    const hourLA = (d: Date) =>
+      parseInt(d.toLocaleString('en-US', { timeZone: 'America/Los_Angeles', hour12: false, hour: '2-digit' }), 10);
+    expect(hourLA(DAYTIME_LA)).toBe(14);
+    expect(hourLA(NIGHT_LA)).toBe(2);
+    // daemon-stop is quiet-gated, so it discriminates the two instants. Without this
+    // the fixtures could both be "night" and the daytime tests would be vacuous.
+    expect(shouldSuppressAlert('daemon-stop', NIGHT_LA)).toBe(true);
+    expect(shouldSuppressAlert('daemon-stop', DAYTIME_LA)).toBe(false);
+  });
+
+  it('suppresses system-scheduled restarts around the clock, not just overnight', () => {
+    // The defect: this suppression was gated on quiet hours only, so it did nothing
+    // during the day — which is when most restarts happen. 332 restarts over 11 days,
+    // all planned, zero crashes.
+    for (const t of ['planned-restart', 'session-refresh']) {
+      expect(shouldSuppressAlert(t, DAYTIME_LA)).toBe(true);
+      expect(shouldSuppressAlert(t, NIGHT_LA)).toBe(true);
+    }
+  });
+
+  it('CONTROL: rate-limited still alerts during the day — it means the agent is PAUSED', () => {
+    // The tempting over-fix is to promote all of QUIET_SUPPRESSED_TYPES to
+    // always-suppressed. That would bury exactly the state an owner needs at 2pm.
+    expect(shouldSuppressAlert('rate-limited', DAYTIME_LA)).toBe(false);
+    expect(shouldSuppressAlert('rate-limited', NIGHT_LA)).toBe(true);
+  });
+
+  it('CONTROL: user-initiated end types still confirm during the day', () => {
+    // These acknowledge a command the owner just issued; silencing them around the
+    // clock removes the only feedback that the command took effect.
+    for (const t of ['user-restart', 'user-disable', 'user-stop']) {
+      expect(shouldSuppressAlert(t, DAYTIME_LA)).toBe(false);
+      expect(shouldSuppressAlert(t, NIGHT_LA)).toBe(true);
+    }
+  });
+
+  it('never suppresses daemon-crashed, at any hour — it is positive evidence', () => {
+    // CONTROL for the demotion below. `.daemon-crashed` is written by the daemon's
+    // uncaughtException handler, so it means something died. It must keep waking
+    // people at 3am. If a future edit demotes the whole notify path, this fails.
+    expect(shouldSuppressAlert('daemon-crashed', DAYTIME_LA)).toBe(false);
+    expect(shouldSuppressAlert('daemon-crashed', NIGHT_LA)).toBe(false);
+  });
+
+  it('ended-without-marker is quiet-gated: held overnight, still said during the day', () => {
+    // The demotion. It used to be excluded from quiet-hours suppression under
+    // "a genuine crash at 3am is worth waking for" — but this type cannot be a
+    // crash (SessionEnd never fires on a kill), and 3/3 occurrences on this host
+    // were false positives. Demoted, NOT silenced: still visible at 2pm.
+    expect(shouldSuppressAlert(ENDED_WITHOUT_MARKER, NIGHT_LA)).toBe(true);
+    expect(shouldSuppressAlert(ENDED_WITHOUT_MARKER, DAYTIME_LA)).toBe(false);
+  });
+
+  it('CONTROL: the demotion did not make it always-suppressed', () => {
+    // The tempting over-fix, given the finding is "this never means a crash", is
+    // to drop it into ALWAYS_SUPPRESSED_TYPES with planned-restart. That would
+    // silence the marker-race signal entirely, which the orchestrator explicitly
+    // ruled against: demote, do not drop. Only the daytime arm catches this.
+    expect(shouldSuppressAlert(ENDED_WITHOUT_MARKER, DAYTIME_LA)).toBe(false);
+  });
+
+  it('does not suppress an unrecognised end type', () => {
+    // Fails toward the owner hearing about it, matching every other polarity
+    // decision in this file.
+    expect(shouldSuppressAlert('something-new', DAYTIME_LA)).toBe(false);
+    expect(shouldSuppressAlert('something-new', NIGHT_LA)).toBe(false);
   });
 });
