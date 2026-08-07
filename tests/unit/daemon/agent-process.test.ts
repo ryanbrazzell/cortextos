@@ -565,6 +565,44 @@ describe('AgentProcess — boot announce gated on restart reason (.restart-plann
     expect(prompt).not.toContain('HANDOFF UX');
   });
 
+  // The non-handoff planned path is only ~4% of restarts, which is exactly why it stayed
+  // broken while the gate read as done: it carried NEITHER clause. The daemon announce
+  // was suppressed, but nothing told the fresh session to skip AGENTS.md:26, so it sent
+  // 'Booting up... one moment' on its own. Suppressing one message is not the same as
+  // suppressing the message the owner actually receives.
+  it('cold boot + planned restart: ALSO suppresses the agent\'s own step-1 boot message', async () => {
+    const prompt = await promptFor({ handoff: false, plannedAgeMs: 1_000 });
+
+    // Control arm: prove we are on the NON-handoff branch, so the assertion below cannot
+    // pass by accidentally routing through the handoff block that already carried it.
+    expect(prompt).not.toContain('HANDOFF UX');
+    expect(prompt).not.toContain(SEND_MANDATE);
+
+    expect(prompt).toContain(STEP_ONE_SUPPRESSION);
+  });
+
+  it('CONTROL: cold boot + UNPLANNED restart still gets step 1 (a real cold boot wants it)', async () => {
+    // Kills the over-fix — emitting the suppression unconditionally. That would silence
+    // the boot ping on genuine crash recovery, which is the one case the owner needs it.
+    const prompt = await promptFor({ handoff: false, plannedAgeMs: null });
+    expect(prompt).not.toContain(STEP_ONE_SUPPRESSION);
+    // Control arm: this really is the announcing branch, not a build that produced nothing.
+    expect(prompt).toContain(COLD_BOOT_ANNOUNCE);
+  });
+
+  it('CONTROL: unplanned cold boot with NO Telegram still gets step 1', async () => {
+    // Kills the tempting-but-wrong gate `!shouldAnnounce`. That is false for two very
+    // different reasons — "this restart was planned" and "Telegram was never wired up" —
+    // and only the first justifies skipping step 1. Under the wrong gate this prompt
+    // would carry the suppression despite being an unplanned cold boot.
+    setupFs({ handoff: false, plannedAgeMs: null });
+    const ap = new AgentProcess('alice', mockEnv, {}); // no setTelegramHandle
+    await ap.start();
+    const prompt = assertRealPrompt(mockPty.spawn.mock.calls[0]?.[1] ?? '');
+
+    expect(prompt).not.toContain(STEP_ONE_SUPPRESSION);
+  });
+
   it('cold boot + UNplanned restart: announces (a real crash must still be heard)', async () => {
     const prompt = await promptFor({ handoff: false, plannedAgeMs: null });
     expect(prompt).toContain(COLD_BOOT_ANNOUNCE);

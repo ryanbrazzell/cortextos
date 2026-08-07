@@ -767,26 +767,44 @@ export class AgentProcess {
     // before cron restoration, before heartbeat, before anything else. Placing this instruction
     // immediately after the handoffBlock in the prompt ensures it is not buried.
     //
-    // The block is assembled from THREE clauses on purpose, because they have different
-    // gates. Emitting it as one blob is what made the pre-fix version wrong:
-    //   intro + stepOneSuppression — every handoff restart, announce or not.
-    //   sendMandate               — only when we actually want the owner pinged.
+    // The clauses are assembled SEPARATELY on purpose, because they have three different
+    // gates. Emitting them as one blob is what made the pre-fix version wrong:
+    //   intro              — every handoff restart, announce or not.
+    //   sendMandate        — only when we actually want the owner pinged.
+    //   stepOneSuppression — every PLANNED restart, handoff or not (see below).
     // Gating the whole block on the announce decision drops the step-1 suppression too,
     // and AGENTS.md:26 / CLAUDE.md:22 then unconditionally instruct the fresh session to
     // send 'Booting up... one moment'. That trades one message for a WORSE one — a
     // cold-boot ping in place of an informative one. Keep the clauses separate.
     const shouldAnnounce = this.shouldAnnounceOnBoot();
+    const isPlanned = this.isPlannedRestart();
     const handoffUxOverride = isHandoffRestart
       ? ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc.'
         + (shouldAnnounce
           ? ' CRITICAL: After reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. Do this BEFORE running heartbeat, BEFORE any other tool call. No cron IDs, no status report, no cold-boot phrasing.'
           : '')
-        + ' Do NOT send "Booting up... one moment" (skip AGENTS.md step 1 entirely).'
+      : '';
+    // Suppressing the agent's OWN step-1 boot message is a separate decision from
+    // suppressing the daemon-injected announce, and it belongs to ALL planned restarts —
+    // handoff (~96% of traffic) and non-handoff alike. Scoping it to the handoff branch
+    // left the non-handoff planned path (~4%) carrying NEITHER clause, so the fresh
+    // session read AGENTS.md:26 and pinged 'Booting up... one moment' anyway.
+    //
+    // Gated on isPlannedRestart(), NOT on `!shouldAnnounce`. Those differ: shouldAnnounce
+    // is also false when Telegram is simply not wired up, and an UNPLANNED cold boot on
+    // such a host must not be told to skip step 1 — it is a real cold boot, and the
+    // instruction would be suppressed for a reason that has nothing to do with intent.
+    //
+    // `isHandoffRestart ||` is retained rather than folded in: a handoff doc on disk is
+    // itself proof the restart was deliberate, and it survives the daemon restarting out
+    // from under the in-process flags when the marker cannot.
+    const stepOneSuppression = isHandoffRestart || isPlanned
+      ? ' Do NOT send "Booting up... one moment" (skip AGENTS.md step 1 entirely).'
       : '';
     const onlineMessage = isHandoffRestart || !shouldAnnounce
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
-    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
+    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${stepOneSuppression}${onlineMessage}${onboardingAppend}`;
   }
 
   private buildContinuePrompt(): string {
