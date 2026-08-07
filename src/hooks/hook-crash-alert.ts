@@ -7,9 +7,12 @@
  *     classifies the exit as "rate-limited" so it is suppressed rather than
  *     spamming a 🚨 CRASH alert every 30 minutes while the daemon respawn
  *     loop continues hitting the wall.
- *   - Applies quiet hours (22:00-07:00 America/Los_Angeles) for routine end
- *     types (planned-restart, session-refresh, daemon-stop, user-*,
- *     rate-limited). A real unexpected crash still pages at night.
+ *   - Suppresses system-scheduled end types (planned-restart, session-refresh)
+ *     around the clock — they report an event nobody requested and nothing the
+ *     owner can act on.
+ *   - Applies quiet hours (22:00-07:00 America/Los_Angeles) to the merely-routine
+ *     types (daemon-stop, user-*, rate-limited), which stay audible during the
+ *     day. A real unexpected crash still pages at night.
  *   - Deduplicates identical alerts for the same agent within 10 minutes so a
  *     broken watchdog loop results in at most one notification, not a buzz
  *     storm.
@@ -23,18 +26,45 @@ const DEDUP_WINDOW_MS = 10 * 60 * 1000;         // 10 minutes
 const QUIET_HOUR_START_LA = 22;                 // 22:00 America/Los_Angeles
 const QUIET_HOUR_END_LA = 7;                    // 07:00 America/Los_Angeles
 
-// End types that are routine and should be suppressed during quiet hours.
-// "crash" is deliberately NOT in this list — a genuine unexpected crash at
-// 3am is worth waking up for.
-const QUIET_SUPPRESSED_TYPES = new Set([
+// End types the system schedules for itself. These carry no information the owner
+// can act on — nobody asked for them and nothing is wrong — so they are suppressed
+// around the clock, not just overnight. 332 restarts over 11 days on this host were
+// ALL of this kind and ZERO were crashes; gating them on quiet hours meant the
+// suppression did nothing during the day, which is when most restarts happen.
+//
+// Kept deliberately SMALL. The obvious change here is to promote all of
+// QUIET_SUPPRESSED_TYPES, and that would be wrong: `rate-limited` means the agent
+// is PAUSED and is exactly what an owner needs to see at 2pm, and the `user-*`
+// types are confirmations of a command the owner just issued. Suppressing those
+// around the clock would hide real state under cover of a noise fix.
+const ALWAYS_SUPPRESSED_TYPES = new Set([
   'planned-restart',
   'session-refresh',
+]);
+
+// End types that are routine ENOUGH to hold overnight but still worth saying during
+// the day. "crash" is deliberately NOT in this list — a genuine unexpected crash at
+// 3am is worth waking up for.
+const QUIET_SUPPRESSED_TYPES = new Set([
+  ...ALWAYS_SUPPRESSED_TYPES,
   'daemon-stop',
   'user-restart',
   'user-disable',
   'user-stop',
   'rate-limited',
 ]);
+
+/**
+ * Whether the Telegram alert for this end type should be withheld.
+ *
+ * Extracted from main() so the policy is testable without spawning the hook. The
+ * crashes.log append happens BEFORE this is consulted and is unconditional, so
+ * suppression here costs visibility in the channel, never the audit trail.
+ */
+export function shouldSuppressAlert(endType: string, now: Date): boolean {
+  if (ALWAYS_SUPPRESSED_TYPES.has(endType)) return true;
+  return isQuietHoursLA(now) && QUIET_SUPPRESSED_TYPES.has(endType);
+}
 
 function isQuietHoursLA(now: Date): boolean {
   const laString = now.toLocaleString('en-US', {
@@ -356,8 +386,7 @@ async function main(): Promise<void> {
 
   // Decide whether to actually send to Telegram.
   const now = new Date();
-  const quiet = isQuietHoursLA(now);
-  if (quiet && QUIET_SUPPRESSED_TYPES.has(endType)) {
+  if (shouldSuppressAlert(endType, now)) {
     return;
   }
   if (shouldSuppressDedup(stateDir, endType)) {

@@ -8,7 +8,7 @@ vi.mock('child_process', () => ({
   execFile: (...args: unknown[]) => execFileMock(...args),
 }));
 
-import { readMaxCrashesPerDay, notifyAgents, classifyFromMarkers } from '../../../src/hooks/hook-crash-alert';
+import { readMaxCrashesPerDay, notifyAgents, classifyFromMarkers, shouldSuppressAlert } from '../../../src/hooks/hook-crash-alert';
 import { clearEndMarkers } from '../../../src/bus/heartbeat';
 
 describe('readMaxCrashesPerDay', () => {
@@ -271,5 +271,66 @@ describe('marker lifecycle (classify → clearEndMarkers → classify)', () => {
     clearEndMarkers(tmp); // successor's first heartbeat — marker still within grace
     expect(existsSync(join(tmp, '.session-refresh'))).toBe(true);
     expect(classifyFromMarkers(tmp, MARKERS).endType).toBe('session-refresh'); // firing #2 — no false crash
+  });
+});
+
+describe('shouldSuppressAlert', () => {
+  // Fixed instants, chosen in America/Los_Angeles terms and expressed in UTC so the
+  // assertions do not depend on the host zone. LA is UTC-7 in August (PDT).
+  const DAYTIME_LA = new Date('2026-08-07T21:00:00Z'); // 14:00 LA — outside quiet hours
+  const NIGHT_LA = new Date('2026-08-07T09:00:00Z');   // 02:00 LA — inside quiet hours
+
+  it('the quiet-hours fixtures really are on opposite sides of the boundary', () => {
+    // Guards the two constants above. If a zone/DST assumption drifted so that both
+    // landed on the same side, every "around the clock" assertion below would still
+    // pass while proving nothing about time-of-day at all.
+    const hourLA = (d: Date) =>
+      parseInt(d.toLocaleString('en-US', { timeZone: 'America/Los_Angeles', hour12: false, hour: '2-digit' }), 10);
+    expect(hourLA(DAYTIME_LA)).toBe(14);
+    expect(hourLA(NIGHT_LA)).toBe(2);
+    // daemon-stop is quiet-gated, so it discriminates the two instants. Without this
+    // the fixtures could both be "night" and the daytime tests would be vacuous.
+    expect(shouldSuppressAlert('daemon-stop', NIGHT_LA)).toBe(true);
+    expect(shouldSuppressAlert('daemon-stop', DAYTIME_LA)).toBe(false);
+  });
+
+  it('suppresses system-scheduled restarts around the clock, not just overnight', () => {
+    // The defect: this suppression was gated on quiet hours only, so it did nothing
+    // during the day — which is when most restarts happen. 332 restarts over 11 days,
+    // all planned, zero crashes.
+    for (const t of ['planned-restart', 'session-refresh']) {
+      expect(shouldSuppressAlert(t, DAYTIME_LA)).toBe(true);
+      expect(shouldSuppressAlert(t, NIGHT_LA)).toBe(true);
+    }
+  });
+
+  it('CONTROL: rate-limited still alerts during the day — it means the agent is PAUSED', () => {
+    // The tempting over-fix is to promote all of QUIET_SUPPRESSED_TYPES to
+    // always-suppressed. That would bury exactly the state an owner needs at 2pm.
+    expect(shouldSuppressAlert('rate-limited', DAYTIME_LA)).toBe(false);
+    expect(shouldSuppressAlert('rate-limited', NIGHT_LA)).toBe(true);
+  });
+
+  it('CONTROL: user-initiated end types still confirm during the day', () => {
+    // These acknowledge a command the owner just issued; silencing them around the
+    // clock removes the only feedback that the command took effect.
+    for (const t of ['user-restart', 'user-disable', 'user-stop']) {
+      expect(shouldSuppressAlert(t, DAYTIME_LA)).toBe(false);
+      expect(shouldSuppressAlert(t, NIGHT_LA)).toBe(true);
+    }
+  });
+
+  it('never suppresses a real crash, at any hour', () => {
+    for (const t of ['crash', 'daemon-crashed']) {
+      expect(shouldSuppressAlert(t, DAYTIME_LA)).toBe(false);
+      expect(shouldSuppressAlert(t, NIGHT_LA)).toBe(false);
+    }
+  });
+
+  it('does not suppress an unrecognised end type', () => {
+    // Fails toward the owner hearing about it, matching every other polarity
+    // decision in this file.
+    expect(shouldSuppressAlert('something-new', DAYTIME_LA)).toBe(false);
+    expect(shouldSuppressAlert('something-new', NIGHT_LA)).toBe(false);
   });
 });
