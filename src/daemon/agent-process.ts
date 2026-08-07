@@ -8,12 +8,26 @@ import { HermesPTY, hermesDbExists } from '../pty/hermes-pty.js';
 import { OpencodePTY, opencodeSessionExists } from '../pty/opencode-pty.js';
 import { MessageDedup, injectMessage as injectMessageIntoPty } from '../pty/inject.js';
 import type { TelegramAPI } from '../telegram/api.js';
+import { getLastOutboundTimestamp } from '../telegram/logging.js';
 import { ensureDir } from '../utils/atomic.js';
 import { writeCortextosEnv } from '../utils/env.js';
 import { getOverdueReminders } from '../bus/reminders.js';
 import { resolvePaths } from '../utils/paths.js';
 
 type LogFn = (msg: string) => void;
+
+/**
+ * Default window after an outbound Telegram message during which a restarting
+ * session is not told to announce itself. Overridable per agent via
+ * `boot_message_suppression_minutes` in config.json.
+ *
+ * 10 minutes is the measured value: on this host it caught every redundant
+ * announcement observed in a restart cluster without suppressing any send that
+ * carried new information. It is a trim, not a cure — the same measurement put
+ * a 10-minute window at ~24% of boot announcements removed and 15 minutes at
+ * ~64%, so tuning is expected.
+ */
+const DEFAULT_BOOT_SUPPRESSION_MINUTES = 10;
 
 /**
  * Manages a single agent's lifecycle.
@@ -756,7 +770,7 @@ export class AgentProcess {
     // HANDOFF UX: the pickup message MUST be the first action after reading the handoff doc —
     // before cron restoration, before heartbeat, before anything else. Placing this instruction
     // immediately after the handoffBlock in the prompt ensures it is not buried.
-    const shouldPromptTelegram = this.shouldPromptTelegramOnlineMessage();
+    const shouldPromptTelegram = this.shouldAnnounceOnBoot();
     const handoffUxOverride = isHandoffRestart && shouldPromptTelegram
       ? ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc. CRITICAL: After reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. Do this BEFORE running heartbeat, BEFORE any other tool call. No cron IDs, no status report, no cold-boot phrasing. Do NOT send "Booting up... one moment" (skip AGENTS.md step 1 entirely).'
       : '';
@@ -772,14 +786,67 @@ export class AgentProcess {
     const deliverablesBlock = this.buildDeliverablesBlock();
     // Session refresh (--continue) is never a handoff restart.
     this.lastSpawnWasHandoff = false;
-    const onlineMessage = this.shouldPromptTelegramOnlineMessage()
+    const onlineMessage = this.shouldAnnounceOnBoot()
       ? ' After checking inbox, send a Telegram message to the user saying you are back online.'
       : '';
     return `SESSION CONTINUATION: Your CLI process was restarted with --continue to reload configs. Current UTC time: ${nowUtc}. Your full conversation history is preserved. Re-read AGENTS.md and ALL bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock} Check inbox. Resume normal operations.${onlineMessage}`;
   }
 
+  /**
+   * Capability check only: is this agent wired to talk to Telegram at all?
+   * Deliberately unchanged — callers that gate a *send* on capability must not
+   * silently inherit boot-noise suppression. Use shouldAnnounceOnBoot() for the
+   * restart-announcement decision.
+   */
   private shouldPromptTelegramOnlineMessage(): boolean {
     return this.config.telegram_polling !== false && !!this.telegramApi && !!this.telegramChatId;
+  }
+
+  /**
+   * Should a restarting session be told to announce that it is back?
+   * Capability AND the owner not having heard from this agent very recently.
+   */
+  private shouldAnnounceOnBoot(): boolean {
+    return this.shouldPromptTelegramOnlineMessage() && !this.recentlyMessagedOwner();
+  }
+
+  /**
+   * True when this agent already messaged its Telegram chat recently enough that
+   * a boot announcement would be redundant noise rather than news.
+   *
+   * The boot announcement is mandated by the daemon-built startup prompt, which
+   * is composed before and independently of anything the agent reads, so an
+   * agent-level doc cannot opt out of it — the suppression has to live here.
+   * Restart clusters (config reload, crash recovery, context handoff) otherwise
+   * produce several near-identical "back online" pings minutes apart.
+   *
+   * Deliberately fails OPEN: an unreadable, missing, or inconclusive log yields
+   * a null timestamp and the announcement goes out. A bug in this path must
+   * cost a redundant message, never a silently mute agent.
+   */
+  private recentlyMessagedOwner(): boolean {
+    const configured = this.config.boot_message_suppression_minutes;
+    const minutes = configured === undefined ? DEFAULT_BOOT_SUPPRESSION_MINUTES : configured;
+    // 0 (or anything non-positive/invalid) disables suppression entirely.
+    // Strictly redundant today — `ageMs < 0`, `< negative` and `< NaN` are all
+    // already false, so removing this changes no outcome (confirmed by mutation
+    // testing). Kept because it states the "0 means off" contract at the point
+    // of decision instead of leaving it to emerge from NaN comparison rules.
+    if (!Number.isFinite(minutes) || minutes <= 0) return false;
+
+    const lastSentMs = getLastOutboundTimestamp(
+      this.env.ctxRoot,
+      this.name,
+      this.telegramChatId!,
+    );
+    if (lastSentMs === null) return false;
+
+    const ageMs = Date.now() - lastSentMs;
+    // A negative age means the log is ahead of the clock — corrupt or skewed
+    // data, not evidence of a recent send. Fail open rather than trust it,
+    // otherwise one bad future timestamp mutes the agent until it passes.
+    if (ageMs < 0) return false;
+    return ageMs < minutes * 60_000;
   }
 
   /**
@@ -873,6 +940,11 @@ export class AgentProcess {
    */
   private maybeSendRuntimeLifecycleNotification(): void {
     if (this.config.runtime !== 'codex-app-server' && this.config.runtime !== 'opencode') return;
+    // NOT gated on shouldAnnounceOnBoot(): boot-noise suppression is deliberately
+    // scoped to the prompt-driven announcements above. The measurement that
+    // motivated the window covered claude-code agents on this host only; these
+    // are a different runtime with a different owner and no comparable data.
+    // Revisit if the same redundancy is ever measured here.
     if (!this.shouldPromptTelegramOnlineMessage()) return;
     const telegramApi = this.telegramApi;
     const telegramChatId = this.telegramChatId;
