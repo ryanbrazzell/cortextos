@@ -4,7 +4,17 @@
  * and last-sent cache (lines 111-113).
  */
 
-import { appendFileSync, readFileSync, writeFileSync, mkdirSync, existsSync } from 'fs';
+import {
+  appendFileSync,
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  openSync,
+  readSync,
+  closeSync,
+  statSync,
+} from 'fs';
 import { join, dirname } from 'path';
 import { logEvent } from '../bus/event.js';
 import type { BusPaths, TelegramMessage } from '../types/index.js';
@@ -53,6 +63,82 @@ export function logOutboundMessage(
   });
 
   appendFileSync(join(logDir, 'outbound-messages.jsonl'), entry + '\n', 'utf-8');
+}
+
+/**
+ * How much of the tail of outbound-messages.jsonl to scan when looking for the
+ * most recent send. The log is append-only and grows without bound (production
+ * logs are ~256KB after 11 days, longest single entry ~6KB), so the boot path
+ * reads a bounded window instead of the whole file.
+ *
+ * Consequence worth naming: if the window happens to contain no entry for the
+ * chat being asked about, this reports "no recent send" even though an older one
+ * exists further back. That is the fail-open direction on purpose — the caller
+ * uses this to SUPPRESS a message, so an inconclusive read must let the message
+ * through rather than silence an agent.
+ */
+const OUTBOUND_TAIL_SCAN_BYTES = 64 * 1024;
+
+/**
+ * Epoch-ms timestamp of the most recent outbound Telegram message this agent
+ * sent to `chatId`, or null if there is no such message in the scanned tail
+ * (or the log is missing/unreadable/malformed).
+ *
+ * Null means "don't know", never "definitely nothing" — see
+ * OUTBOUND_TAIL_SCAN_BYTES. Callers must treat null as the permissive case.
+ */
+export function getLastOutboundTimestamp(
+  ctxRoot: string,
+  agentName: string,
+  chatId: string | number,
+): number | null {
+  const logPath = join(ctxRoot, 'logs', agentName, 'outbound-messages.jsonl');
+  const chatIdStr = String(chatId);
+
+  let raw: string;
+  try {
+    if (!existsSync(logPath)) return null;
+    const size = statSync(logPath).size;
+    if (size === 0) return null;
+    const start = Math.max(0, size - OUTBOUND_TAIL_SCAN_BYTES);
+    const length = size - start;
+    const buf = Buffer.alloc(length);
+    const fd = openSync(logPath, 'r');
+    try {
+      readSync(fd, buf, 0, length, start);
+    } finally {
+      closeSync(fd);
+    }
+    raw = buf.toString('utf-8');
+    // A non-zero start almost certainly lands mid-entry; drop that fragment so
+    // it cannot parse into a bogus record. Defence-in-depth only: with today's
+    // one-object-per-line format a truncated fragment already fails JSON.parse
+    // and is skipped below, so disabling this branch changes no outcome
+    // (confirmed by mutation testing). Kept because it is the correct shape for
+    // a bounded tail read and stays correct if the entry format ever changes.
+    if (start > 0) {
+      const firstNewline = raw.indexOf('\n');
+      raw = firstNewline === -1 ? '' : raw.slice(firstNewline + 1);
+    }
+  } catch {
+    return null;
+  }
+
+  // Scan backwards: the newest matching entry wins and lets us stop early.
+  // Entries are appended in send order, so the last match is the most recent.
+  const lines = raw.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    try {
+      const obj = JSON.parse(line);
+      if (String(obj.chat_id) !== chatIdStr) continue;
+      const ms = Date.parse(obj.timestamp);
+      if (Number.isNaN(ms)) continue;
+      return ms;
+    } catch { /* skip malformed */ }
+  }
+  return null;
 }
 
 /**

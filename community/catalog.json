@@ -1,6 +1,6 @@
 {
   "version": "1.0.0",
-  "updated_at": "2026-06-06T09:30:00Z",
+  "updated_at": "2026-07-31T16:35:00Z",
   "items": [
     {
       "name": "agentic-crm-assistant",
@@ -337,6 +337,18 @@
       "dependencies": [],
       "install_path": "community/skills/voice-agent-factory",
       "submitted_at": "2026-06-06T09:30:00Z"
+    },
+    {
+      "name": "claude-to-codex-migration",
+      "description": "Migrate ANY cortextOS agent from the claude-code runtime to the live codex-app-server runtime (gpt-5-codex/gpt-5.5). Non-destructive, dry-run by default; give it a source agent and it produces a separate codex-shaped agent, mapping CLAUDE.md / .claude/skills / .mcp.json / hooks onto the codex adapter.",
+      "author": "cortextos",
+      "type": "skill",
+      "version": "1.0.0",
+      "tags": ["migration", "codex", "claude-code", "runtime", "agent", "codex-app-server"],
+      "review_status": "approved",
+      "dependencies": [],
+      "install_path": "community/skills/claude-to-codex-migration",
+      "submitted_at": "2026-07-31T16:35:00Z"
     }
   ]
 }
