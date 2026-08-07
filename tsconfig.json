@@ -1,9 +1,11 @@
 {
+  "//": "tsup owns the build (tsup.config.ts) and emits CJS into dist/. tsc is a TYPECHECKER ONLY here, so noEmit is pinned: this config says module ESNext, and a bare `tsc`/`tsc -b` would otherwise emit ESM over tsup output under a type:commonjs package, breaking every entry point. Kept as a \"//\" key rather than a JSONC comment because tooling here parses this file as strict JSON.",
   "compilerOptions": {
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "bundler",
     "lib": ["ES2022"],
+    "noEmit": true,
     "outDir": "dist",
     "rootDir": "src",
     "strict": true,
