@@ -74,6 +74,13 @@ export class AgentProcess {
   // should announce itself — see isPlannedRestart(). Lost if the whole daemon restarts,
   // which is why the marker remains as the fallback.
   private lastExitWasCrash = false;
+  // Set by sessionRefresh() before it tears the PTY down; consumed by the next start().
+  // The session-time-cap rollover is daemon-scheduled, so the boot that follows it is
+  // planned — but unlike self-restart/hard-restart it writes no `.restart-planned`, so
+  // the marker cannot see it. This flag is how that path declares itself: same shape as
+  // lastExitWasCrash, opposite sense. Ranked BELOW the crash flag in isPlannedRestart()
+  // so a genuine crash still announces even if a refresh left this set.
+  private plannedSessionRefresh = false;
 
   constructor(name: string, env: CtxEnv, config: AgentConfig, log?: LogFn) {
     this.name = name;
@@ -119,6 +126,9 @@ export class AgentProcess {
     // One-shot: the announce decision for this start has now been made, so a later
     // PLANNED restart is not treated as a crash just because an older one was.
     this.lastExitWasCrash = false;
+    // Same one-shot discipline in the opposite direction: a refresh suppresses exactly
+    // the boot it caused, never the next one.
+    this.plannedSessionRefresh = false;
 
     this.log(`Starting in ${mode} mode`);
     this.status = 'starting';
@@ -310,6 +320,12 @@ export class AgentProcess {
    */
   async sessionRefresh(): Promise<void> {
     this.log('Session refresh (--continue restart)');
+    // Declare this restart planned BEFORE tearing the PTY down, so the boot prompt built
+    // inside the start() below suppresses its 'back online' announce. Must be set here
+    // rather than derived at prompt time: this path writes no `.restart-planned`, and the
+    // `.session-refresh` marker written just below is the HOOK's channel — reusing it here
+    // would couple two consumers with different lifetimes to one file.
+    this.plannedSessionRefresh = true;
     // Write .session-refresh marker so the SessionEnd crash-alert hook
     // (src/hooks/hook-crash-alert.ts) classifies the imminent PTY exit as a
     // session refresh rather than a crash. The hook's marker handler +
@@ -779,24 +795,16 @@ export class AgentProcess {
     const deliverablesBlock = this.buildDeliverablesBlock();
     // Session refresh (--continue) is never a handoff restart.
     this.lastSpawnWasHandoff = false;
-    // Gated on the same seam as the startup path for consistency, but be clear about
-    // what this does and does not currently buy — it is NOT the config-reload fix it
-    // might look like.
-    //
-    // This builder is reachable two ways:
-    //   1. the session timer firing at max_session_seconds (~71h) -> sessionRefresh()
-    //      at agent-process.ts:1041. That path writes NO `.restart-planned`, so the
-    //      gate does not fire and the announce still goes out. It is daemon-scheduled
-    //      and therefore a false positive, but it is NOT yet suppressed.
+    // Gated on the same seam as the startup path. This builder is reachable two ways,
+    // and the gate now fires on both:
+    //   1. the session timer firing at max_session_seconds (~71h) -> sessionRefresh().
+    //      That path writes NO `.restart-planned`, so the marker cannot see it; it
+    //      declares itself planned via plannedSessionRefresh instead. Suppressed.
     //   2. a daemon start that finds conversation history and no `.force-fresh`
-    //      (operator restart, host reboot). Correctly announces when unplanned.
+    //      (operator restart, host reboot). Neither signal is set, so it announces —
+    //      correct, since nothing scheduled it.
     // forceContextRestart does NOT reach here — it writes `.force-fresh`, so
     // shouldContinue() is false and it routes to buildStartupPrompt instead.
-    //
-    // Closing case 1 needs the refresh to declare itself planned (an in-process flag
-    // set before sessionRefresh(), like lastExitWasCrash but with the opposite sense).
-    // Deliberately not done here: it is a distinct behavior change and belongs with its
-    // own tests rather than smuggled into this commit.
     const onlineMessage = this.shouldAnnounceOnBoot()
       ? ' After checking inbox, send a Telegram message to the user saying you are back online.'
       : '';
@@ -850,6 +858,10 @@ export class AgentProcess {
     // its 120s grace to clear it), so marker-only logic would read a genuine crash as
     // planned and stay silent for up to PLANNED_RESTART_TTL_MS after every restart.
     if (this.lastExitWasCrash) return false;
+    // The session-time-cap rollover is planned but marker-less — see plannedSessionRefresh.
+    // Checked after the crash flag so the crash still wins, and before the marker read
+    // because there is no marker to find on this path.
+    if (this.plannedSessionRefresh) return true;
     try {
       const markerPath = join(this.env.ctxRoot, 'state', this.name, '.restart-planned');
       if (!existsSync(markerPath)) return false;

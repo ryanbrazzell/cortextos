@@ -627,12 +627,12 @@ describe('AgentProcess — boot announce gated on restart reason (.restart-plann
   });
 
   it('--continue refresh is gated on the same seam', async () => {
-    // Verifies the gate is WIRED into buildContinuePrompt — not that it fires in
-    // production. The marker state synthesized here is not currently reachable on the
-    // continue path: the session-timer refresh that reaches this builder writes no
-    // `.restart-planned`, so the real ~71h refresh still announces. See the comment on
-    // buildContinuePrompt. This test locks in the wiring so closing that gap later is a
-    // one-line change with coverage already in place.
+    // Verifies the gate is WIRED into buildContinuePrompt via the MARKER signal, which
+    // is the daemon-restart case (operator restart / host reboot while a self-restart
+    // marker happens to be fresh). It deliberately does NOT prove the ~71h refresh is
+    // suppressed — that path writes no marker and is covered by the two tests below,
+    // which drive sessionRefresh() itself. Keeping both: this one would go green again
+    // if the refresh flag were deleted, so it must not be read as covering that path.
     setupFs({ handoff: false, plannedAgeMs: 1_000 });
     fsMocks.existsSync.mockImplementation((path: string) => {
       if (path.endsWith('/.restart-planned')) return true;
@@ -653,5 +653,89 @@ describe('AgentProcess — boot announce gated on restart reason (.restart-plann
     expect(mockPty.spawn).toHaveBeenCalledTimes(1);
     expect(prompt).toContain('SESSION CONTINUATION');
     expect(prompt).not.toContain(COLD_BOOT_ANNOUNCE);
+  });
+
+  /**
+   * Drive a real sessionRefresh() through stop() + start().
+   *
+   * stop() sleeps through the Ctrl-C -> /exit dance and then awaits the PTY exit, so the
+   * refresh is stepped with fake timers rather than costing 6s of wall clock. Everything
+   * under test — the flag set in sessionRefresh(), the read in isPlannedRestart(), the
+   * one-shot clear in start() — runs for real.
+   */
+  async function stepThroughStop(action: () => Promise<void>) {
+    vi.useFakeTimers();
+    try {
+      const pending = action();
+      await vi.advanceTimersByTimeAsync(6_000); // Ctrl-C sleep(1000) + /exit sleep(5000)
+      capturedOnExit?.(0, 0); // resolves the exit promise stop() is waiting on
+      await vi.advanceTimersByTimeAsync(15_000); // the Promise.race timeout, if still armed
+      await pending;
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  const runSessionRefresh = (ap: InstanceType<typeof AgentProcess>) =>
+    stepThroughStop(() => ap.sessionRefresh());
+
+  it('the ~71h session refresh does NOT announce (real path, no marker synthesized)', async () => {
+    // The defect 7633fac documented and this closes: buildContinuePrompt was gated, but
+    // the only production path reaching it — the session timer at max_session_seconds ->
+    // sessionRefresh() — writes NO `.restart-planned`. The gate could not see it, so the
+    // announce still went out every ~71h while the wiring test above read as coverage.
+    // plannedAgeMs: null is the point — there is no marker here, exactly as in production.
+    setupFs({ handoff: false, plannedAgeMs: null });
+    const ap = new AgentProcess('alice', mockEnv, {});
+    ap.setTelegramHandle({} as never, '12345');
+    vi.spyOn(ap as never, 'shouldContinue').mockReturnValue(true as never);
+
+    await ap.start(); // the session the refresh will roll over
+    mockPty.spawn.mockClear();
+    await runSessionRefresh(ap);
+
+    const prompt = mockPty.spawn.mock.calls[0]?.[1] ?? '';
+    expect(mockPty.spawn).toHaveBeenCalledTimes(1);
+    expect(prompt).toContain('SESSION CONTINUATION'); // not vacuous: a prompt was built
+    expect(prompt).not.toContain(COLD_BOOT_ANNOUNCE);
+  });
+
+  it('CONTROL: an unplanned --continue boot still announces (nothing scheduled it)', async () => {
+    // Control arm for the test above. Identical setup and identical branch, minus the
+    // sessionRefresh() call. Without this, that test would pass just as happily if the
+    // continue prompt had stopped announcing for any reason at all — a deleted string, a
+    // broken telegram handle, an always-true isPlannedRestart() — none of which is the
+    // behavior it claims to lock in.
+    setupFs({ handoff: false, plannedAgeMs: null });
+    const ap = new AgentProcess('alice', mockEnv, {});
+    ap.setTelegramHandle({} as never, '12345');
+    vi.spyOn(ap as never, 'shouldContinue').mockReturnValue(true as never);
+
+    await ap.start();
+
+    const prompt = mockPty.spawn.mock.calls[0]?.[1] ?? '';
+    expect(prompt).toContain('SESSION CONTINUATION');
+    expect(prompt).toContain(COLD_BOOT_ANNOUNCE);
+  });
+
+  it('the refresh suppression is one-shot — the boot AFTER a refresh announces again', async () => {
+    // The flag is cleared in start() right after the prompt is built. If that clear were
+    // dropped, or moved before the build, one ~71h rollover would silence every
+    // subsequent boot of that process — including a crash restart.
+    setupFs({ handoff: false, plannedAgeMs: null });
+    const ap = new AgentProcess('alice', mockEnv, {});
+    ap.setTelegramHandle({} as never, '12345');
+    vi.spyOn(ap as never, 'shouldContinue').mockReturnValue(true as never);
+
+    await ap.start();
+    await runSessionRefresh(ap);
+    mockPty.spawn.mockClear();
+
+    // A subsequent unplanned start (operator restart, host reboot) must be audible again.
+    await stepThroughStop(() => ap.stop());
+    await ap.start();
+
+    const prompt = mockPty.spawn.mock.calls[0]?.[1] ?? '';
+    expect(prompt).toContain(COLD_BOOT_ANNOUNCE);
   });
 });
