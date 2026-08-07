@@ -627,8 +627,12 @@ describe('AgentProcess — boot announce gated on restart reason (.restart-plann
   });
 
   it('--continue refresh is gated on the same seam', async () => {
-    // buildContinuePrompt is a separate production behavior change and needs its own
-    // coverage, not inheritance from the startup-path tests.
+    // Verifies the gate is WIRED into buildContinuePrompt — not that it fires in
+    // production. The marker state synthesized here is not currently reachable on the
+    // continue path: the session-timer refresh that reaches this builder writes no
+    // `.restart-planned`, so the real ~71h refresh still announces. See the comment on
+    // buildContinuePrompt. This test locks in the wiring so closing that gap later is a
+    // one-line change with coverage already in place.
     setupFs({ handoff: false, plannedAgeMs: 1_000 });
     fsMocks.existsSync.mockImplementation((path: string) => {
       if (path.endsWith('/.restart-planned')) return true;

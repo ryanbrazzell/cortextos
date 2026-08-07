@@ -779,9 +779,24 @@ export class AgentProcess {
     const deliverablesBlock = this.buildDeliverablesBlock();
     // Session refresh (--continue) is never a handoff restart.
     this.lastSpawnWasHandoff = false;
-    // Same false-positive class as the startup path: a --continue refresh is a config
-    // reload, not news. Gated on the same seam rather than left open, which is exactly
-    // the half-fix this task has already produced twice.
+    // Gated on the same seam as the startup path for consistency, but be clear about
+    // what this does and does not currently buy — it is NOT the config-reload fix it
+    // might look like.
+    //
+    // This builder is reachable two ways:
+    //   1. the session timer firing at max_session_seconds (~71h) -> sessionRefresh()
+    //      at agent-process.ts:1041. That path writes NO `.restart-planned`, so the
+    //      gate does not fire and the announce still goes out. It is daemon-scheduled
+    //      and therefore a false positive, but it is NOT yet suppressed.
+    //   2. a daemon start that finds conversation history and no `.force-fresh`
+    //      (operator restart, host reboot). Correctly announces when unplanned.
+    // forceContextRestart does NOT reach here — it writes `.force-fresh`, so
+    // shouldContinue() is false and it routes to buildStartupPrompt instead.
+    //
+    // Closing case 1 needs the refresh to declare itself planned (an in-process flag
+    // set before sessionRefresh(), like lastExitWasCrash but with the opposite sense).
+    // Deliberately not done here: it is a distinct behavior change and belongs with its
+    // own tests rather than smuggled into this commit.
     const onlineMessage = this.shouldAnnounceOnBoot()
       ? ' After checking inbox, send a Telegram message to the user saying you are back online.'
       : '';
