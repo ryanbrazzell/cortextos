@@ -57,6 +57,18 @@ export interface Task {
   due_date: string | null;
   archived: boolean;
   result?: string;
+  /**
+   * Why the task is in its CURRENT status — most usefully, what would
+   * unblock a `blocked` task. Deliberately separate from `result`, which
+   * `compactTasks` treats as a completion summary; overloading it would
+   * put "waiting on PR #308" into archive summaries as if it were an
+   * outcome.
+   *
+   * Scoped to the current status on purpose: `updateTask` clears it on
+   * any transition that does not supply a new note, so a stale unblock
+   * condition cannot outlive the block it described.
+   */
+  status_note?: string;
   /** Linked deliverables (files saved via `cortextos bus save-output`). */
   outputs?: TaskOutput[];
   /**
