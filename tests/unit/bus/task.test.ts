@@ -517,6 +517,57 @@ describe('Task audit log (append-only JSONL)', () => {
     expect(log[2].to).toBe('pending');
   });
 
+  describe('updateTask --note (status reason)', () => {
+    const readTask = (id: string) =>
+      JSON.parse(readFileSync(findTaskFile(paths, id)!, 'utf-8'));
+
+    it('records the reason on the task when blocking', () => {
+      const id = createTask(paths, 'alice', 'acme', 'Blocked thing', { assignee: 'alice' });
+      updateTask(paths, id, 'blocked', 'waiting on PR #308 to merge');
+
+      expect(readTask(id).status_note).toBe('waiting on PR #308 to merge');
+    });
+
+    it('writes the reason into the audit log too, so it survives later transitions', () => {
+      const id = createTask(paths, 'alice', 'acme', 'Audited block', { assignee: 'alice' });
+      updateTask(paths, id, 'blocked', 'waiting on PR #308');
+      updateTask(paths, id, 'in_progress');
+
+      const log = readTaskAudit(paths, id);
+      expect(log[1].note).toBe('waiting on PR #308');
+      // The historical reason is still readable even though the live field cleared.
+      expect(readTask(id).status_note).toBeUndefined();
+    });
+
+    it('CLEARS a stale reason on a transition that supplies none', () => {
+      const id = createTask(paths, 'alice', 'acme', 'Unblocked thing', { assignee: 'alice' });
+      updateTask(paths, id, 'blocked', 'waiting on PR #308');
+      expect(readTask(id).status_note).toBe('waiting on PR #308');
+
+      // Unblocking must not leave the unblock condition sitting there looking live.
+      updateTask(paths, id, 'in_progress');
+
+      const task = readTask(id);
+      expect(task.status_note).toBeUndefined();
+      expect('status_note' in task).toBe(false);
+    });
+
+    it('replaces the reason when a new one is supplied', () => {
+      const id = createTask(paths, 'alice', 'acme', 'Rereason', { assignee: 'alice' });
+      updateTask(paths, id, 'blocked', 'waiting on PR #308');
+      updateTask(paths, id, 'blocked', 'now waiting on a product decision');
+
+      expect(readTask(id).status_note).toBe('now waiting on a product decision');
+    });
+
+    it('does not invent the field when no reason is given', () => {
+      const id = createTask(paths, 'alice', 'acme', 'Noteless', { assignee: 'alice' });
+      updateTask(paths, id, 'blocked');
+
+      expect('status_note' in readTask(id)).toBe(false);
+    });
+  });
+
   it('audit log is append-only — existing entries are never overwritten', () => {
     const id = createTask(paths, 'alice', 'acme', 'Append proof');
     const path = join(paths.taskDir, 'audit', `${id}.jsonl`);

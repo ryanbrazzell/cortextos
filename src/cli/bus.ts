@@ -199,7 +199,8 @@ busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
-  .action((id: string, status: string) => {
+  .option('--note <text>', 'Why the task is moving to this status — for blocked, what would unblock it')
+  .action((id: string, status: string, opts: { note?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -219,8 +220,19 @@ busCommand
       }
     }
 
-    updateTask(paths, id, status as TaskStatus);
-    console.log(`Updated ${id} -> ${status}`);
+    // Nudge, not a hard failure: `update-task <id> blocked` with no reason is
+    // documented in the orchestrator/approvals/human-tasks templates, so
+    // rejecting it outright would break those flows fleet-wide. Warn on stderr
+    // (stdout stays clean for anything parsing the confirmation line).
+    if (status === 'blocked' && !opts.note) {
+      console.error(
+        `WARNING: blocking ${id} without --note. Nobody can tell what would unblock it — ` +
+        `the next session re-derives the blocker or treats this as stale.`,
+      );
+    }
+
+    updateTask(paths, id, status as TaskStatus, opts.note);
+    console.log(`Updated ${id} -> ${status}${opts.note ? ` (${opts.note})` : ''}`);
   });
 
 busCommand
@@ -406,6 +418,11 @@ busCommand
       const assignee = (t.assigned_to || '-').substring(0, 16).padEnd(17);
       const title = t.title.substring(0, 50);
       console.log(`  ${statusIcon}${priIcon}${id}${assignee}${title}`);
+      // Second line rather than a column: the reason is a sentence, and the
+      // whole point is that it is readable without opening the task JSON.
+      if (t.status_note) {
+        console.log(`          ↳ ${t.status_note}`);
+      }
     }
     console.log('');
   });

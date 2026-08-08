@@ -49,7 +49,7 @@ Tasks with `needs_approval: true` create an approval item that must be reviewed 
 |--------|---------|
 | Create | `cortextos bus create-task "<title>" --desc "<desc>" [--assignee <a>] [--priority <p>]` |
 | List | `cortextos bus list-tasks [--status S] [--agent A] [--priority P]` |
-| Update | `cortextos bus update-task <id> <status>` |
+| Update | `cortextos bus update-task <id> <status> [--note "<why>"]` |
 | Complete | `cortextos bus complete-task <id> --result "[summary]"` |
 | Log event | `cortextos bus log-event <category> <event> <severity> --meta '[json]'` |
 

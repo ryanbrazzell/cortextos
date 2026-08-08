@@ -27,7 +27,7 @@ Agent secrets: `orgs/{org}/agents/{agent}/.env`
 | Command | What it does |
 |---|---|
 | `create-task "<title>" --desc "<desc>"` | Create a task (visible on dashboard) |
-| `update-task <id> <status>` | Update status: pending / in_progress / blocked / completed |
+| `update-task <id> <status> [--note <why>]` | Update status: pending / in_progress / blocked / completed. Use `--note` to record WHY — for `blocked`, what would unblock it. A later status change clears it. |
 | `complete-task <id> --result "<what>"` | Mark done with result |
 | `list-tasks [--status S] [--agent A]` | List / filter tasks |
 | `check-stale-tasks` | Find tasks stale >2h in_progress |
