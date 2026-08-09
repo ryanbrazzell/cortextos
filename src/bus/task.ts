@@ -80,23 +80,41 @@ export function createTask(
     for (const downId of blocks) detectCycleOrThrow(paths, downId, [taskId], virtualTask);
   }
 
-  // Peers BEFORE the task itself. If a peer cannot be written, the create
-  // fails having produced nothing: no orphan task committed under an
-  // assignee who is never notified (the id is returned at the very end, so
-  // a throw here would also swallow it), and re-running is a genuine retry
-  // rather than a duplicate. A peer left pointing at a task that then fails
-  // to write is a dangling ref, which this module already tolerates by
-  // design — strictly the milder of the two failure states.
+  // Peers BEFORE the task itself, so a failed create commits no orphan task
+  // under an assignee who is never notified (the id is returned at the very
+  // end, so a throw here would also swallow it).
+  //
+  // Every applied edge is then ROLLED BACK if any peer fails. The earlier
+  // claim here — that a leftover edge is a tolerated dangling ref and a
+  // re-run is a genuine retry — was FALSE for create, and the difference is
+  // `taskId`: updateTask is handed a stable id, so its retry recomputes the
+  // same diff and the idempotent helpers converge. Here the id is GENERATED
+  // per call. A failed create's id never reaches disk and never will, so a
+  // peer left pointing at it is blocked by a task that cannot be created,
+  // repaired, or completed; check-deps reports it as an open dependency
+  // while `listTasks --respect-deps` ignores missing ids and shows the same
+  // task as unblocked. Re-running mints a DIFFERENT id, adding a second
+  // edge beside the stranded one instead of replacing it.
+  //
+  // Rollback is unconditionally safe precisely because the id is fresh: no
+  // pre-existing state can legitimately reference it, so removing it from a
+  // peer can never discard an edge we did not just write.
   const edgeFailures: string[] = [];
+  const applied: Array<{ peerId: string; field: 'blocks' | 'blocked_by' }> = [];
   for (const depId of blockedBy) {
     const outcome = addSymmetricEdge(paths, depId, 'blocks', taskId);
-    if (!outcome.ok) edgeFailures.push(outcome.reason);
+    if (outcome.ok) applied.push({ peerId: depId, field: 'blocks' });
+    else edgeFailures.push(outcome.reason);
   }
   for (const downId of blocks) {
     const outcome = addSymmetricEdge(paths, downId, 'blocked_by', taskId);
-    if (!outcome.ok) edgeFailures.push(outcome.reason);
+    if (outcome.ok) applied.push({ peerId: downId, field: 'blocked_by' });
+    else edgeFailures.push(outcome.reason);
   }
-  throwIfEdgesFailed(taskId, edgeFailures);
+  if (edgeFailures.length) {
+    edgeFailures.push(...rollbackAppliedEdges(paths, taskId, applied));
+    throwIfCreateEdgesFailed(taskId, edgeFailures);
+  }
 
   const task: Task = {
     id: taskId,
@@ -259,6 +277,11 @@ function validateNewPeerIds(...lists: Array<string[] | undefined>): void {
  * Peers that already succeeded are left applied rather than rolled back:
  * both helpers are idempotent, so the retry converges on them harmlessly,
  * and an add is a no-op the reconciliation will simply re-affirm.
+ *
+ * That rationale depends on `taskId` being STABLE across the retry, which
+ * is true of updateTask (the caller supplies it) and false of createTask
+ * (it is generated per call). createTask therefore rolls back and uses
+ * `throwIfCreateEdgesFailed` instead — do not reuse this one there.
  */
 function throwIfEdgesFailed(taskId: string, failures: string[]): void {
   if (!failures.length) return;
@@ -266,6 +289,55 @@ function throwIfEdgesFailed(taskId: string, failures: string[]): void {
     `Task ${taskId} NOT updated: ${failures.length} symmetric edge update(s) failed — ` +
     `${failures.join('; ')}. The task itself is unchanged; any peer edges that did apply are ` +
     `idempotent. Fix the peer task file(s) and re-run this command to complete the edit.`,
+  );
+}
+
+/**
+ * Undo the peer edges a failing createTask already applied.
+ *
+ * Returns the reasons for any removals that themselves failed, so the
+ * caller can name them in the thrown error. A rollback that silently
+ * fails would recreate the exact stranded-edge state this exists to
+ * prevent, while reporting a clean abort — the same swallow-and-claim-
+ * success shape the module is meant to eliminate. Best-effort by
+ * necessity: the remaining peers are still attempted after one fails,
+ * because a peer we CAN repair should not be left broken by one we
+ * cannot.
+ */
+function rollbackAppliedEdges(
+  paths: BusPaths,
+  taskId: string,
+  applied: Array<{ peerId: string; field: 'blocks' | 'blocked_by' }>,
+): string[] {
+  const failures: string[] = [];
+  for (const { peerId, field } of applied) {
+    const outcome = removeSymmetricEdge(paths, peerId, field, taskId);
+    if (!outcome.ok) failures.push(`ROLLBACK FAILED: ${outcome.reason}`);
+  }
+  return failures;
+}
+
+/**
+ * createTask's counterpart to `throwIfEdgesFailed`.
+ *
+ * Says "create a new task" rather than "re-run this command to complete
+ * the edit": the id in this message is dead, so advice phrased around
+ * completing THIS task would be false. When rollback also failed the
+ * message must be explicit that manual repair is needed, because that is
+ * the one path where a peer really is left pointing at a task that will
+ * never exist.
+ */
+function throwIfCreateEdgesFailed(taskId: string, failures: string[]): void {
+  if (!failures.length) return;
+  const stranded = failures.filter(f => f.startsWith('ROLLBACK FAILED:'));
+  const tail = stranded.length
+    ? `${stranded.length} peer edge(s) could NOT be rolled back and still reference ${taskId}, ` +
+      `which will never exist — remove that id from those peer files by hand.`
+    : `No task was created and all applied peer edges were rolled back; fix the peer task ` +
+      `file(s) and create the task again (it will get a new id).`;
+  throw new Error(
+    `Task ${taskId} NOT created: ${failures.length - stranded.length} symmetric edge update(s) ` +
+    `failed — ${failures.join('; ')}. ${tail}`,
   );
 }
 

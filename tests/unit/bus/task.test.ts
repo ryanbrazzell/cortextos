@@ -1228,7 +1228,54 @@ describe('recovery is real: a retry after a peer failure repairs the graph (roun
     expect(readdirSync(paths.taskDir).filter(f => f.endsWith('.json')).length).toBe(before);
   });
 
-  it('the failure message names the direction and field, not just the peer id', () => {
+  it('createTask STRANDS NO PEER: an earlier peer that succeeded is rolled back (round 3 HIGH)', () => {
+    // The single-peer test above cannot reach this: with the only peer already
+    // corrupt, no EARLIER peer is ever successfully mutated, so the multi-peer
+    // case it is named for never happens, and asserting the task-file count
+    // says nothing about what happened to the peers.
+    const d1 = createTask(paths, 'alice', 'acme', 'Downstream 1');
+    const d2 = createTask(paths, 'alice', 'acme', 'Downstream 2');
+    const before = readdirSync(paths.taskDir).filter(f => f.endsWith('.json')).length;
+    breakPeer(d2); // d1 is mutated successfully first, THEN d2 fails
+
+    expect(() => createTask(paths, 'bob', 'acme', 'Work', { blocks: [d1, d2] })).toThrow();
+
+    // Without rollback d1.blocked_by holds a generated id that was never
+    // written and never will be: check-deps calls d1 blocked forever, and a
+    // re-run mints a DIFFERENT id beside the stranded one instead of
+    // replacing it. Peer state, not the task count, is the assertion.
+    expect(read(d1).blocked_by).toBeUndefined();
+    // d2 stays corrupt — that is the premise, not a failure. Assert rollback
+    // left it byte-identical rather than parsing it (parsing it here was a
+    // bug that made this test fail for the wrong reason).
+    expect(readFileSync(join(paths.taskDir, `${d2}.json`), 'utf-8')).toBe('{not json');
+    expect(readdirSync(paths.taskDir).filter(f => f.endsWith('.json')).length).toBe(before);
+  });
+
+  it('a failed createTask names a DEAD id: advice is "create again", never "re-run to complete"', () => {
+    const d1 = createTask(paths, 'alice', 'acme', 'Downstream 1');
+    const d2 = createTask(paths, 'alice', 'acme', 'Downstream 2');
+    breakPeer(d2);
+
+    let msg = '';
+    try { createTask(paths, 'bob', 'acme', 'Work', { blocks: [d1, d2] }); }
+    catch (e) { msg = e instanceof Error ? e.message : String(e); }
+
+    // updateTask's message tells the operator to re-run and complete the edit.
+    // For create that instruction is FALSE — the id is gone with the call.
+    expect(msg).toContain('NOT created');
+    expect(msg).toMatch(/new id/i);
+    expect(msg).not.toMatch(/complete the edit/i);
+  });
+
+  it('the failure message names the direction and field, not just the peer id (round 1, not round 2)', () => {
+    // HONESTY NOTE, added in round 3: this test sits in the round-2 block but
+    // guards a ROUND-1 property. Round 1 already added the directional detail,
+    // so this passes with round 2's reorder reverted — it is not evidence for
+    // the reorder. The tests that actually discriminate round 2 are 'a failed
+    // edit leaves the task itself UNCHANGED' (update) and the orphan/stranded
+    // peer tests (create). Left here, relabelled, rather than deleted: the
+    // property is still worth guarding, it just proves something else.
     const work = createTask(paths, 'alice', 'acme', 'Work');
     const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
     breakPeer(blocker);
