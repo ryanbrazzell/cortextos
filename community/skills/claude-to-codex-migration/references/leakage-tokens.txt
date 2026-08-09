@@ -1,0 +1,19 @@
+# Claude-only leakage tokens — grep custom skills + instruction files + scripts.
+# A hit means the artifact references Claude-Code-only machinery. Some hits are
+# mechanically rewritable (paths, env-var names); some signal non-portable
+# BEHAVIOR that needs a human/skill-creator rewrite. Grep-clean is NECESSARY but
+# NOT SUFFICIENT — a clean skill can still depend on Claude tool semantics that
+# don't appear as a literal string (confirm with a boot probe).
+#
+# == Mechanically rewritable (convert.py rewrites these) ==
+.claude/skills        # -> plugins/cortextos-agent-skills/skills
+.claude/              # path ref; rewrite or drop
+ANTHROPIC_API_KEY     # codex model auth is host ~/.codex/auth.json; drop the mention
+CLAUDE_CODE_OAUTH_TOKEN  # same; drop
+#
+# == Behavioral leakage (NEEDS-HUMAN -> skill-creator if load-bearing) ==
+ExitPlanMode          # Claude plan-mode hook; codex has no plan-mode lifecycle event
+bypassPermissions     # Claude permission mode; codex is hardcoded autonomous
+hook-                 # any cortextos bus hook-* call relied on by the skill
+mcp__                 # Claude MCP tool-name namespace (e.g. mcp__playwright__*)
+/loop                 # Claude-CLI /loop macro, no codex equivalent

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 // node-pty is native; stub it so constructing AgentPTY never touches it.
 vi.mock('node-pty', () => ({ spawn: vi.fn() }));
@@ -58,5 +58,121 @@ describe('AgentPTY --dangerously-skip-permissions toggle', () => {
     } finally {
       warn.mockRestore();
     }
+  });
+});
+
+// A stub node-pty handle injected via spawnFn so spawn() never touches the native addon.
+const mockPty = { pid: 7, write: vi.fn(), onData: vi.fn(), onExit: vi.fn(), kill: vi.fn(), resize: vi.fn() };
+
+function newPty(config: any) {
+  const pty = new AgentPTY(mockEnv, config);
+  (pty as any).spawnFn = () => mockPty;
+  return pty;
+}
+
+describe('AgentPTY working_directory validation', () => {
+  beforeEach(() => { vi.useFakeTimers(); mockPty.write.mockClear(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
+
+  it('rejects a whitespace-only working_directory', async () => {
+    await expect(newPty({ working_directory: '   ' }).spawn('fresh', 'P'))
+      .rejects.toThrow(/whitespace-only/);
+  });
+
+  it('rejects a nonexistent working_directory (existsSync=false)', async () => {
+    await expect(newPty({ working_directory: '/no/such/dir' }).spawn('fresh', 'P'))
+      .rejects.toThrow(/does not exist/);
+  });
+
+  it('does NOT validate an unset working_directory (falls through to agentDir)', async () => {
+    const pty = newPty({});
+    await expect(pty.spawn('fresh', 'P')).resolves.toBeUndefined();
+    pty.kill();
+  });
+
+  it('does NOT reject the empty-string "unset" sentinel', async () => {
+    const pty = newPty({ working_directory: '' });
+    await expect(pty.spawn('fresh', 'P')).resolves.toBeUndefined();
+    pty.kill();
+  });
+});
+
+describe('AgentPTY first-run wedge detection (awaiting interactive confirmation)', () => {
+  beforeEach(() => { vi.useFakeTimers(); mockPty.write.mockClear(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
+
+  it('flags awaiting when a bypass prompt is still showing at the backstop and not bootstrapped', async () => {
+    const pty = newPty({});
+    await pty.spawn('fresh', 'P');
+    // Capital-P "Permissions" is NOT the lowercase "permissions" bootstrap token.
+    pty.getOutputBuffer().push('2. Yes, I accept - Bypass Permissions mode');
+    await vi.advanceTimersByTimeAsync(46000);
+    expect(pty.isAwaitingInteractiveConfirmation()).toBe(true);
+  });
+
+  it('never flags once the session has bootstrapped', async () => {
+    const pty = newPty({});
+    await pty.spawn('fresh', 'P');
+    pty.getOutputBuffer().push('accept edits · permissions');
+    await vi.advanceTimersByTimeAsync(46000);
+    expect(pty.isAwaitingInteractiveConfirmation()).toBe(false);
+  });
+
+  it('clears the wedge flag on late recovery (bootstrap after the backstop)', async () => {
+    const pty = newPty({});
+    await pty.spawn('fresh', 'P');
+    pty.getOutputBuffer().push('2. Yes, I accept - Bypass Permissions mode');
+    await vi.advanceTimersByTimeAsync(46000);
+    expect(pty.isAwaitingInteractiveConfirmation()).toBe(true);
+    pty.getOutputBuffer().push('permissions');
+    expect(pty.isAwaitingInteractiveConfirmation()).toBe(false);
+  });
+});
+
+describe('AgentPTY broadened auto-accept token match (rec B)', () => {
+  beforeEach(() => { vi.useFakeTimers(); mockPty.write.mockClear(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
+
+  it('injects Enter for a "directory" trust-prompt variant', async () => {
+    const pty = newPty({});
+    await pty.spawn('fresh', 'P');
+    pty.getOutputBuffer().push('Do you trust the files in this directory?');
+    await vi.advanceTimersByTimeAsync(1300);
+    expect(mockPty.write).toHaveBeenCalledWith('\r');
+  });
+
+  it('injects Down+Enter for a lowercase "bypass" prompt variant', async () => {
+    // Fixture avoids the lowercase "permissions" bootstrap token so the poll's
+    // top-of-tick bootstrap self-stop does not fire before the bypass branch.
+    const pty = newPty({});
+    await pty.spawn('fresh', 'P');
+    pty.getOutputBuffer().push('bypass mode ... 2. Yes, I accept');
+    await vi.advanceTimersByTimeAsync(1700);
+    expect(mockPty.write).toHaveBeenCalledWith('\x1b[B');
+  });
+
+  it('does NOT inject on benign single-token output', async () => {
+    const pty = newPty({});
+    await pty.spawn('fresh', 'P');
+    pty.getOutputBuffer().push('please accept the changes and open the directory');
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(mockPty.write).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentPTY structural no-keystroke-into-live-session invariant', () => {
+  beforeEach(() => { vi.useFakeTimers(); mockPty.write.mockClear(); });
+  afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); });
+
+  it('writes NO keystroke once bootstrapped even if prompt tokens linger in the buffer', async () => {
+    // The real session is up ("permissions" status bar) but the recent buffer
+    // still carries first-run prompt tokens. The poll must self-stop at the top
+    // of the tick BEFORE any bypass/trust branch, so no stray Down/Enter leaks
+    // into the live session. Fails against the old ordering (branches first).
+    const pty = newPty({});
+    await pty.spawn('fresh', 'P');
+    pty.getOutputBuffer().push('Bypass Permissions ... 2. Yes, I accept · permissions');
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(mockPty.write).not.toHaveBeenCalled();
   });
 });
