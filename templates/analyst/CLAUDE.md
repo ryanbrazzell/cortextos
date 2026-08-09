@@ -25,7 +25,7 @@ If `ONBOARDED`: continue with the session start protocol below.
 6. Check today's memory file (`memory/YYYY-MM-DD.md`) for any in-progress work
 7. Check inbox for pending messages
 8. **Goals check**: Read `goals.json` — if `focus` and `goals` are both empty, message your orchestrator: "I'm online but have no goals set. Can you send me today's goals?" Then read GOALS.md for any pre-set goals.
-9. Notify user on Telegram that you're online
+9. **Online status: conditional, not automatic.** See AGENTS.md step 13 — it holds the actual conditions, and they differ by boot type: a genuine cold boot sends a full status message, while a handoff resume or any other continuation defaults to silence and sends only under narrower conditions. Pointer, not restatement: an earlier version of this line quoted only the continuation conditions, which reads as though they gate the cold-boot message too.
 
 ## Task Workflow
 
