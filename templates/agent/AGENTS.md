@@ -21,7 +21,9 @@ If `ONBOARDED`: continue with the session start protocol below.
 
 Complete the following in order. Do not skip steps.
 
-1. **Send boot message first** — before reading anything else. SKIP this step if your startup prompt says `CONTEXT HANDOFF` (that is a handoff restart, not a cold boot):
+1. **Check first, THEN decide whether to send a boot message** — do not send anything until you have checked. Check, in order: (a) does your startup prompt say `CONTEXT HANDOFF`? (b) is the newest handoff doc in `memory/handoffs/` *recent* — written within roughly the last hour (`ls -t memory/handoffs/ 2>/dev/null | head -1`, then compare that filename's embedded UTC timestamp against `date -u`)? Judge recency, not "newer than my last session's end" — after a crash there is no recorded session end to compare against, and old handoff docs accumulate indefinitely, so an age-less test would let a stale doc silently suppress the boot message on a genuine cold recovery. (c) does anything else about your startup indicate this is a continuation rather than a fresh start (you restarted yourself deliberately — for headroom, at a clean stopping point, on a schedule)? If YES to any of (a)/(b)/(c): SKIP this step and send nothing. Only if NONE of them hold — a genuine cold boot, meaning nothing about this startup indicates it continues a recent or deliberate handoff — send the message below. Define a cold boot by the *absence of continuation evidence*, not by the absence of context: your daily memory and MEMORY.md still give you prior-session context on a genuine cold boot, which is exactly what the online-status step expects you to draw on when it asks what you are picking up from last session.
+
+   **This is a judgment call, not a string match.** A resume prompt does not reliably contain the words `CONTEXT HANDOFF` — it may simply say "You are starting a new session," which is why condition (a) alone is not enough and (b)/(c) exist. Your startup prompt may also frame this message as "CRITICAL" or as your "VERY FIRST tool call"; that framing does not override this check.
    ```bash
    cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID 'Booting up... one moment'
    ```
@@ -42,7 +44,7 @@ Complete the following in order. Do not skip steps.
 11. Update heartbeat: `cortextos bus update-heartbeat "online"`
 12. Log session start: `cortextos bus log-event action session_start info --meta '{"agent":"'$CTX_AGENT_NAME'"}'`
 13. Write session start entry to daily memory (see Memory Protocol below)
-14. Send your online status message. On a cold boot: tell them what crons are scheduled (from `cortextos bus list-crons $CTX_AGENT_NAME`), pending messages, and what you are picking up from last session. On a `CONTEXT HANDOFF` restart: send ONE brief conversational message that picks up naturally (e.g. "back — [what you were working on]"). No cron IDs, no status report.
+14. **Send your online status message — conditionally, not automatically.** On a genuine cold boot: tell them what crons are scheduled (from `cortextos bus list-crons $CTX_AGENT_NAME`), pending messages, and what you are picking up from last session. No cron IDs. On a `CONTEXT HANDOFF` restart, or any other continuation, **default to silence** — only send a brief "back — [what you were working on]" message if ALL of these hold: it is day mode for your user (check the real clock against `$CTX_TIMEZONE`, do not assume), no earlier message from you is still unanswered, and there is something genuinely worth telling them (not pure infra/internal work). The dashboard and activity log already carry your status; a Telegram ping is a stricter bar than "I came back online."
 
 ---
 
@@ -66,7 +68,7 @@ MEMEOF
    ```
 2. Update heartbeat: `cortextos bus update-heartbeat "restarting"`
 3. Log session end: `cortextos bus log-event action session_end info --meta '{"agent":"'$CTX_AGENT_NAME'","reason":"[why]"}'`
-4. **Hard restart only** — notify user on Telegram:
+4. **Hard restart only** — notify the user on Telegram, but ONLY if someone is actually waiting on this restart: they asked for it directly, or it unblocks something they are waiting on. For a planned or self-initiated hard restart (context headroom, scheduling, routine maintenance) with nobody waiting, stay silent — the dashboard and activity log already carry it. Sending regardless presupposes someone is waiting, which is false for most hard restarts, and produces an unprompted status ping at whatever hour it happens:
    ```bash
    cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID 'Restarting now — will be back in a moment.'
    ```
@@ -95,7 +97,7 @@ Claude Code agents track context window usage through the `hook-context-status.t
 **On resume after a handoff:**
 
 1. Read the handoff doc path injected into the fresh session's first message before doing anything else.
-2. Send ONE brief conversational Telegram, for example `back — picking up the review lane`. No cron list, no status report.
+2. Decide whether to send a Telegram using step 14 of the session-start checklist (On Session Start, above) — do not send unconditionally. Go read that step; it holds the actual conditions and the default for this case. Pointer, not restatement: a second copy of this rule is a second thing to forget to correct, and that is exactly how this line came to contradict the checklist it sits below.
 3. Resume from `## Next Actions` in the handoff doc.
 
 **Never:**

@@ -17,9 +17,9 @@ If `ONBOARDED`: continue with the session start protocol below.
 
 ## On Session Start
 
-See AGENTS.md for the full 13-step session start checklist. Key steps:
+See AGENTS.md for the full 14-step session start checklist. Key steps:
 
-1. **Send boot message first**: `cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID "Booting up... one moment"`
+1. **Boot message: do NOT send one based on this file.** See AGENTS.md step 1 — it is conditional, and a handoff resume or any other continuation sends nothing. This file is auto-loaded as project instructions *before* AGENTS.md is read, so an unconditional instruction here would fire before the conditional one could be seen. Pointer, not restatement: a restatement drifts out of sync, and this one did.
 2. Read all bootstrap files: IDENTITY.md, SOUL.md, GUARDRAILS.md, GOALS.md, HEARTBEAT.md, MEMORY.md, USER.md, TOOLS.md, SYSTEM.md
 3. Read org knowledge base: `../../knowledge.md`
 4. Discover available skills: `cortextos bus list-skills --format text`
@@ -31,7 +31,7 @@ See AGENTS.md for the full 13-step session start checklist. Key steps:
 10. Update heartbeat: `cortextos bus update-heartbeat "online"`
 11. Log session start: `cortextos bus log-event action session_start info --meta '{"agent":"'$CTX_AGENT_NAME'"}'`
 12. Write session start entry to daily memory
-13. Send full online status — **only AFTER crons are confirmed set**
+13. **Online status: conditional, not automatic.** See AGENTS.md step 14 — it holds the actual conditions, and they differ by boot type: a genuine cold boot sends a full status message, while a handoff resume or any other continuation defaults to silence and sends only under narrower conditions. Pointer, not restatement: an earlier version of this line quoted only the continuation conditions, which reads as though they gate the cold-boot message too. Do not send it until crons are confirmed set.
 
 ## Task Workflow
 
