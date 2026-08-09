@@ -1068,9 +1068,13 @@ describe('edge maintenance is atomic and never silently partial (PR #36 review, 
     // dependency, the peer never got the reverse edge, and the command
     // reported success over a now-asymmetric graph.
     expect(() => updateTask(paths, work, 'blocked', { blockedBy: [blocker] }))
-      .toThrow(/asymmetric|edge/i);
+      .toThrow(/edge update\(s\) failed/i);
 
-    expect(read(work).blocked_by).toEqual([blocker]);
+    // Round 2 changed what the task looks like afterwards: peers are now
+    // written BEFORE the task, so a peer failure aborts the edit entirely
+    // instead of committing the task and leaving the graph asymmetric.
+    expect(read(work).blocked_by).toBeUndefined();
+    expect(read(work).status).toBe('pending');
   });
 
   it('reports failure when the peer write fails while REMOVING an edge', () => {
@@ -1088,18 +1092,22 @@ describe('edge maintenance is atomic and never silently partial (PR #36 review, 
       .toThrow(/asymmetric|edge/i);
   });
 
-  it('still records the status transition it actually made when a peer write fails', () => {
+  // Round 1 asserted the INVERSE of this: that a peer failure still wrote
+  // the task and still recorded the transition, on the reasoning that the
+  // self write "really happened" so the audit must not omit it. Round 2
+  // removed the premise — the task is no longer written at all — and the
+  // audit invariant flips with it. Kept as an explicit test rather than
+  // deleted, because "no transition happened, so none is recorded" is the
+  // property that makes the audit log trustworthy.
+  it('records NO audit transition when the edit was aborted by a peer failure', () => {
     const work = createTask(paths, 'alice', 'acme', 'Work');
     const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
     corrupt(blocker);
 
     expect(() => updateTask(paths, work, 'blocked', { blockedBy: [blocker] })).toThrow();
 
-    // The self write DID happen, so the audit must not lie by omission.
-    expect(read(work).status).toBe('blocked');
-    const updates = readTaskAudit(paths, work).filter(e => e.event === 'update');
-    expect(updates).toHaveLength(1);
-    expect(updates[0].to).toBe('blocked');
+    expect(read(work).status).toBe('pending');
+    expect(readTaskAudit(paths, work).filter(e => e.event === 'update')).toEqual([]);
   });
 
   // ---- Preservation: a dangling ref is NOT a failure ----
@@ -1127,5 +1135,112 @@ describe('edge maintenance is atomic and never silently partial (PR #36 review, 
 
     expect(read(work).blocked_by).toEqual([blocker]);
     expect(read(blocker).blocks).toEqual([work]);
+  });
+});
+
+describe('recovery is real: a retry after a peer failure repairs the graph (round 2)', () => {
+  let testDir: string;
+  let paths: BusPaths;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-retry-test-'));
+    paths = {
+      ctxRoot: testDir,
+      inbox: join(testDir, 'inbox', 'x'),
+      inflight: join(testDir, 'inflight', 'x'),
+      processed: join(testDir, 'processed', 'x'),
+      logDir: join(testDir, 'logs', 'x'),
+      stateDir: join(testDir, 'state', 'x'),
+      taskDir: join(testDir, 'tasks'),
+      approvalDir: join(testDir, 'approvals'),
+      analyticsDir: join(testDir, 'analytics'),
+      heartbeatDir: join(testDir, 'heartbeats'),
+    };
+  });
+
+  afterEach(() => { rmSync(testDir, { recursive: true, force: true }); });
+
+  const path = (id: string) => join(paths.taskDir, `${id}.json`);
+  const read = (id: string) => JSON.parse(readFileSync(path(id), 'utf-8'));
+  const breakPeer = (id: string) => {
+    const saved = readFileSync(path(id), 'utf-8');
+    writeFileSync(path(id), '{not json');
+    return () => writeFileSync(path(id), saved); // operator repairs the file
+  };
+
+  it('ADD direction: re-running the command after fixing the peer writes the reverse edge', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    const repair = breakPeer(blocker);
+
+    expect(() => updateTask(paths, work, 'blocked', { blockedBy: [blocker] })).toThrow();
+    repair();
+
+    // The error tells the operator to re-run. That instruction has to be TRUE:
+    // the retry must either repair the graph or fail again — never report
+    // success over a still-asymmetric graph.
+    updateTask(paths, work, 'blocked', { blockedBy: [blocker] });
+
+    expect(read(work).blocked_by).toEqual([blocker]);
+    expect(read(blocker).blocks).toEqual([work]);
+  });
+
+  it('REMOVE direction: re-running after fixing the peer retires the stale reverse edge', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    updateTask(paths, work, 'blocked', { blockedBy: [blocker] });
+    expect(read(blocker).blocks).toEqual([work]);
+
+    const repair = breakPeer(blocker);
+    expect(() => updateTask(paths, work, 'in_progress', { blockedBy: [] })).toThrow();
+    repair();
+
+    updateTask(paths, work, 'in_progress', { blockedBy: [] });
+
+    // A surviving reverse edge here pins `blocker` against compaction forever.
+    expect(read(work).blocked_by).toBeUndefined();
+    expect(read(blocker).blocks).toBeUndefined();
+  });
+
+  it('a failed edit leaves the task itself UNCHANGED, so the retry has correct old state', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    const before = read(work);
+    breakPeer(blocker);
+
+    expect(() => updateTask(paths, work, 'blocked', { blockedBy: [blocker] })).toThrow();
+
+    // Committing the self side first is what made the retry a no-op.
+    expect(read(work).status).toBe(before.status);
+    expect(read(work).blocked_by).toBeUndefined();
+  });
+
+  it('createTask leaves NO orphan when a peer write fails — nothing to notify, nothing to duplicate', () => {
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    const before = readdirSync(paths.taskDir).filter(f => f.endsWith('.json')).length;
+    breakPeer(blocker);
+
+    // Previously: the task was committed and assigned, then the throw ate the
+    // returned id — so the CLI never printed it and never notified the
+    // assignee, and the advised re-run produced a DUPLICATE rather than a fix.
+    expect(() => createTask(paths, 'bob', 'acme', 'Work', { blockedBy: [blocker] })).toThrow();
+
+    expect(readdirSync(paths.taskDir).filter(f => f.endsWith('.json')).length).toBe(before);
+  });
+
+  it('the failure message names the direction and field, not just the peer id', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    breakPeer(blocker);
+
+    // With five mutations and one failure, "peer 3 failed" alone does not tell
+    // an operator which reverse edge to repair.
+    let msg = '';
+    try { updateTask(paths, work, 'blocked', { blockedBy: [blocker] }); }
+    catch (e) { msg = e instanceof Error ? e.message : String(e); }
+
+    expect(msg).toContain(blocker);
+    expect(msg).toMatch(/add/i);
+    expect(msg).toMatch(/blocks/);
   });
 });

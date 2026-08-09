@@ -69,7 +69,7 @@ export function createTask(
   // leave partial state on disk. Earlier iteration wrote the task
   // JSON before detectCycleOrThrow ran, so a failed cycle check left
   // a dangling task with a one-way edge and no symmetric peer update.
-  // Order is now: validate → write task → mutate peers → audit. The
+  // Order is: validate → mutate peers → write task → audit. The
   // cycle walker gets a `virtual` description of the not-yet-written
   // task so chains that pass through it are still detectable.
   validateNewPeerIds(blockedBy, blocks);
@@ -79,6 +79,24 @@ export function createTask(
   if (blocks.length) {
     for (const downId of blocks) detectCycleOrThrow(paths, downId, [taskId], virtualTask);
   }
+
+  // Peers BEFORE the task itself. If a peer cannot be written, the create
+  // fails having produced nothing: no orphan task committed under an
+  // assignee who is never notified (the id is returned at the very end, so
+  // a throw here would also swallow it), and re-running is a genuine retry
+  // rather than a duplicate. A peer left pointing at a task that then fails
+  // to write is a dangling ref, which this module already tolerates by
+  // design — strictly the milder of the two failure states.
+  const edgeFailures: string[] = [];
+  for (const depId of blockedBy) {
+    const outcome = addSymmetricEdge(paths, depId, 'blocks', taskId);
+    if (!outcome.ok) edgeFailures.push(outcome.reason);
+  }
+  for (const downId of blocks) {
+    const outcome = addSymmetricEdge(paths, downId, 'blocked_by', taskId);
+    if (!outcome.ok) edgeFailures.push(outcome.reason);
+  }
+  throwIfEdgesFailed(taskId, edgeFailures);
 
   const task: Task = {
     id: taskId,
@@ -105,22 +123,7 @@ export function createTask(
   ensureDir(paths.taskDir);
   atomicWriteSync(join(paths.taskDir, `${taskId}.json`), JSON.stringify(task));
 
-  // Cycle-safe now: validation already passed, so symmetric-edge
-  // maintenance is just mutating peer JSONs. A peer that cannot be
-  // written is still reported — see throwIfEdgesFailed.
-  const edgeFailures: string[] = [];
-  for (const depId of blockedBy) {
-    const outcome = addSymmetricEdge(paths, depId, 'blocks', taskId);
-    if (!outcome.ok) edgeFailures.push(outcome.reason);
-  }
-  for (const downId of blocks) {
-    const outcome = addSymmetricEdge(paths, downId, 'blocked_by', taskId);
-    if (!outcome.ok) edgeFailures.push(outcome.reason);
-  }
-
   appendTaskAudit(paths, taskId, { event: 'create', agent: agentName, to: 'pending', note: title });
-
-  throwIfEdgesFailed(taskId, edgeFailures);
 
   return taskId;
 }
@@ -134,9 +137,18 @@ export function createTask(
  */
 type EdgeOutcome = { ok: true } | { ok: false; reason: string };
 
-const edgeFailure = (taskId: string, err: unknown): EdgeOutcome => ({
+const edgeFailure = (
+  taskId: string,
+  op: 'add' | 'remove',
+  field: 'blocks' | 'blocked_by',
+  err: unknown,
+): EdgeOutcome => ({
   ok: false,
-  reason: `${taskId} (${err instanceof Error ? err.message : String(err)})`,
+  // Name the operation and the field, not just the peer: with several
+  // mutations in one command, "peer X failed" does not tell an operator
+  // WHICH reverse edge to repair — least of all when the same peer is
+  // touched through both directions in the same edit.
+  reason: `${op} ${taskId}.${field} (${err instanceof Error ? err.message : String(err)})`,
 });
 
 /**
@@ -162,7 +174,7 @@ function addSymmetricEdge(
   try {
     filePath = findTaskFile(paths, taskId);
   } catch (err) {
-    return edgeFailure(taskId, err);
+    return edgeFailure(taskId, 'add', field, err);
   }
   if (!filePath) return { ok: true }; // Peer task missing — surfaced at resolution time.
   try {
@@ -174,7 +186,7 @@ function addSymmetricEdge(
     }
     return { ok: true };
   } catch (err) {
-    return edgeFailure(taskId, err);
+    return edgeFailure(taskId, 'add', field, err);
   }
 }
 
@@ -195,7 +207,7 @@ function removeSymmetricEdge(
   try {
     filePath = findTaskFile(paths, taskId);
   } catch (err) {
-    return edgeFailure(taskId, err);
+    return edgeFailure(taskId, 'remove', field, err);
   }
   if (!filePath) return { ok: true };
   try {
@@ -208,7 +220,7 @@ function removeSymmetricEdge(
     atomicWriteSync(filePath, JSON.stringify(task));
     return { ok: true };
   } catch (err) {
-    return edgeFailure(taskId, err);
+    return edgeFailure(taskId, 'remove', field, err);
   }
 }
 
@@ -237,16 +249,23 @@ function validateNewPeerIds(...lists: Array<string[] | undefined>): void {
 
 /**
  * Turn collected peer-edge failures into one loud, actionable error.
- * Called AFTER the audit entry is appended: the task's own write really
- * did happen, so suppressing its audit record would trade one silent
- * inconsistency for another.
+ *
+ * Called BEFORE the task's own write, so the advice it gives is true: the
+ * task is unchanged and re-running really does retry the failed peers.
+ * An earlier version threw after the write and still said "re-run", which
+ * was actively harmful — the retry saw its own committed state, computed
+ * an empty diff, and reported success over a graph it had not repaired.
+ *
+ * Peers that already succeeded are left applied rather than rolled back:
+ * both helpers are idempotent, so the retry converges on them harmlessly,
+ * and an add is a no-op the reconciliation will simply re-affirm.
  */
 function throwIfEdgesFailed(taskId: string, failures: string[]): void {
   if (!failures.length) return;
   throw new Error(
-    `Task ${taskId} was written, but ${failures.length} symmetric edge update(s) failed: ` +
-    `${failures.join('; ')}. The dependency graph is now ASYMMETRIC and needs repair — ` +
-    `fix the peer task file(s) and re-run this command.`,
+    `Task ${taskId} NOT updated: ${failures.length} symmetric edge update(s) failed — ` +
+    `${failures.join('; ')}. The task itself is unchanged; any peer edges that did apply are ` +
+    `idempotent. Fix the peer task file(s) and re-run this command to complete the edit.`,
   );
 }
 
@@ -414,15 +433,12 @@ export function updateTask(
   // not surface from inside peer maintenance after the task is committed.
   validateNewPeerIds(blockedBy, blocks);
 
-  let prevStatus: TaskStatus | undefined;
-  let assignee: string | undefined;
+  let task: Task;
   let oldBlockedBy: string[] = [];
   let oldBlocks: string[] = [];
   try {
     const content = readFileSync(filePath, 'utf-8');
-    const task: Task = JSON.parse(content);
-    prevStatus = task.status;
-    assignee = task.assigned_to;
+    task = JSON.parse(content);
     oldBlockedBy = normalizeEdgeList(task.blocked_by);
     oldBlocks = normalizeEdgeList(task.blocks);
 
@@ -438,25 +454,26 @@ export function updateTask(
         detectCycleOrThrow(paths, downId, [taskId], virtual);
       }
     }
-
-    task.status = status;
-    if (blockedBy !== undefined) {
-      if (blockedBy.length) task.blocked_by = [...blockedBy];
-      else delete task.blocked_by;
-    }
-    if (blocks !== undefined) {
-      if (blocks.length) task.blocks = [...blocks];
-      else delete task.blocks;
-    }
-    task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-    atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
 
-  // Peer maintenance only after the cycle check passed and the task
-  // itself is written. Replacing a list means retiring the reverse
-  // edges it dropped, not just adding the new ones.
+  // Peer maintenance BEFORE the task's own write, and this ordering is
+  // load-bearing rather than cosmetic.
+  //
+  // Which peers to touch is derived by diffing the requested lists against
+  // the task's CURRENT on-disk lists. Committing the task first therefore
+  // destroyed the very state that diff reads: on a retry `oldBlockedBy`
+  // already equalled the requested list, the diff came out empty, no peer
+  // write was re-attempted, and the command reported SUCCESS over a still
+  // asymmetric graph — while its own error message had told the operator to
+  // re-run. Silent corruption that a retry appears to fix is worse than the
+  // swallowed error this replaced.
+  //
+  // With the write last, a failure leaves the task untouched, so the retry
+  // recomputes the identical diff and genuinely repairs. Both edge helpers
+  // are idempotent (add no-ops when present, remove no-ops when absent), so
+  // re-running over already-applied peers is safe.
   const edgeFailures: string[] = [];
   const record = (outcome: EdgeOutcome) => { if (!outcome.ok) edgeFailures.push(outcome.reason); };
 
@@ -476,10 +493,27 @@ export function updateTask(
       record(removeSymmetricEdge(paths, downId, 'blocked_by', taskId));
     }
   }
+  throwIfEdgesFailed(taskId, edgeFailures);
+
+  const prevStatus = task.status;
+  const assignee = task.assigned_to;
+  try {
+    task.status = status;
+    if (blockedBy !== undefined) {
+      if (blockedBy.length) task.blocked_by = [...blockedBy];
+      else delete task.blocked_by;
+    }
+    if (blocks !== undefined) {
+      if (blocks.length) task.blocks = [...blocks];
+      else delete task.blocks;
+    }
+    task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+    atomicWriteSync(filePath, JSON.stringify(task));
+  } catch (err) {
+    throw new Error(`Task ${taskId} update failed: ${err}`);
+  }
 
   appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
-
-  throwIfEdgesFailed(taskId, edgeFailures);
 }
 
 /**
