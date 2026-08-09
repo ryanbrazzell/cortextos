@@ -1362,4 +1362,58 @@ describe('rollback removes only what it inserted (round 4 HIGH: id collision)', 
     // toContain() misuse against undefined.
     expect(read(peer).blocks).toEqual([existing]);
   });
+
+  it('a failed TASK write rolls back peers that already succeeded (round 5 HIGH)', () => {
+    // The round-3 tests cannot reach this: they all fail INSIDE the peer loop,
+    // so `edgeFailures` is non-empty and rollback runs. Here every peer edge
+    // succeeds and the task's own write is what fails — the one path that used
+    // to skip rollback entirely.
+    const peer = createTask(paths, 'alice', 'acme', 'Peer P');
+
+    // Force the id so the write destination is known in advance, then park a
+    // DIRECTORY on it: atomicWriteSync's final renameSync onto a directory
+    // fails, which is a real filesystem failure arriving after the peer loop
+    // rather than a mocked throw. Digits are forced only for the call under
+    // test, so `peer` above keeps a real unique id.
+    const epoch = Date.now();
+    forced.digits = '12345678';
+    vi.spyOn(Date, 'now').mockReturnValue(epoch);
+    mkdirSync(join(paths.taskDir, `task_${epoch}_12345678.json`), { recursive: true });
+
+    expect(() => createTask(paths, 'bob', 'acme', 'Doomed', { blockedBy: [peer] })).toThrow();
+
+    // `blockedBy: [peer]` writes the REVERSE edge, so the field to assert on
+    // is peer.BLOCKS. Asserting peer.blocked_by here passed pre-fix — not
+    // because rollback worked, but because that field was never written in
+    // either direction, which is a test that proves nothing.
+    //
+    // Pre-fix this held the generated id forever: the task it names was never
+    // written and never will be, so check-deps calls P blocked by a task that
+    // cannot be created, completed, or repaired. Peer state is the assertion —
+    // a task-file COUNT would be wrong here, because the directory parked
+    // above ends with .json and readdirSync counts it.
+    expect(read(peer).blocks).toBeUndefined();
+  });
+
+  it('the task-write failure does NOT claim zero edges failed', () => {
+    // Routing this path through throwIfCreateEdgesFailed printed
+    // "0 symmetric edge update(s) failed" — true but useless, and it points
+    // the operator at peer files that are perfectly fine.
+    const peer = createTask(paths, 'alice', 'acme', 'Peer P');
+    const epoch = Date.now();
+    forced.digits = '87654321';
+    vi.spyOn(Date, 'now').mockReturnValue(epoch);
+    mkdirSync(join(paths.taskDir, `task_${epoch}_87654321.json`), { recursive: true });
+
+    let msg = '';
+    try { createTask(paths, 'bob', 'acme', 'Doomed', { blockedBy: [peer] }); }
+    catch (e) { msg = e instanceof Error ? e.message : String(e); }
+
+    expect(msg).toContain('NOT created');
+    expect(msg).toMatch(/writing the task file failed/i);
+    expect(msg).not.toMatch(/0 symmetric edge update\(s\) failed/);
+    // Rollback succeeded here, so it must NOT tell anyone to repair by hand.
+    expect(msg).not.toMatch(/by hand/i);
+    expect(msg).toMatch(/new id/i);
+  });
 });

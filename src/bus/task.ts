@@ -145,9 +145,26 @@ export function createTask(
     ...(blocks.length ? { blocks: [...blocks] } : {}),
   };
 
-  ensureDir(paths.taskDir);
-  atomicWriteSync(join(paths.taskDir, `${taskId}.json`), JSON.stringify(task));
+  // The task's OWN write gets the same rollback the peer loop gets. Rollback
+  // used to run only inside `if (edgeFailures.length)`, so the one path where
+  // every peer SUCCEEDED and this write then threw walked straight out of the
+  // function with `applied` edges still on disk, pointing at an id that never
+  // reached it — exactly the stranded-peer state the loop above exists to
+  // prevent, reached through the only door left open. Found in round 5; it is
+  // the residual flagged in round 3 as the "phantom blocker" trade and then
+  // left alone for two rounds because it was already written down.
+  try {
+    ensureDir(paths.taskDir);
+    atomicWriteSync(join(paths.taskDir, `${taskId}.json`), JSON.stringify(task));
+  } catch (err) {
+    throwTaskWriteFailed(taskId, err, rollbackAppliedEdges(paths, taskId, applied));
+  }
 
+  // DELIBERATELY OUTSIDE the guard above, and it must stay that way. By this
+  // line the task file IS on disk. Rolling its peer edges back on an audit
+  // failure would strip the reverse edges from a task that genuinely exists
+  // and still declares those edges in its own JSON — promoting a lost audit
+  // line into real graph corruption, which is the strictly worse outcome.
   appendTaskAudit(paths, taskId, { event: 'create', agent: agentName, to: 'pending', note: title });
 
   return taskId;
@@ -329,6 +346,42 @@ function rollbackAppliedEdges(
 }
 
 /**
+ * The one instruction that must read identically no matter WHICH createTask
+ * failure produced it: some peer still points at an id that will never exist,
+ * and only a human can remove it. Shared so the two throw sites cannot drift
+ * into describing the same manual repair two different ways.
+ */
+const strandedByHandTail = (taskId: string, stranded: number): string =>
+  `${stranded} peer edge(s) could NOT be rolled back and still reference ${taskId}, ` +
+  `which will never exist — remove that id from those peer files by hand.`;
+
+/**
+ * createTask's OTHER failure mode: every peer edge applied cleanly and the
+ * task's own write then failed.
+ *
+ * Deliberately not routed through `throwIfCreateEdgesFailed`. That helper
+ * reports a count of failed edge updates, and here that count is ZERO — the
+ * edges all worked, the file write did not. Reusing it would print
+ * "0 symmetric edge update(s) failed" beside a real failure and send the
+ * operator looking at peer files that are fine.
+ *
+ * Returns `never`: the caller's `try` block must not fall through to the
+ * audit append after this runs.
+ */
+function throwTaskWriteFailed(taskId: string, err: unknown, rollbackFailures: string[]): never {
+  const reason = err instanceof Error ? err.message : String(err);
+  const tail = rollbackFailures.length
+    ? strandedByHandTail(taskId, rollbackFailures.length)
+    : `No task was created and all applied peer edges were rolled back; ` +
+      `create the task again (it will get a new id).`;
+  throw new Error(
+    `Task ${taskId} NOT created: writing the task file failed — ${reason}. ` +
+    (rollbackFailures.length ? `${rollbackFailures.join('; ')}. ` : '') +
+    tail,
+  );
+}
+
+/**
  * createTask's counterpart to `throwIfEdgesFailed`.
  *
  * Says "create a new task" rather than "re-run this command to complete
@@ -342,8 +395,7 @@ function throwIfCreateEdgesFailed(taskId: string, failures: string[]): void {
   if (!failures.length) return;
   const stranded = failures.filter(f => f.startsWith('ROLLBACK FAILED:'));
   const tail = stranded.length
-    ? `${stranded.length} peer edge(s) could NOT be rolled back and still reference ${taskId}, ` +
-      `which will never exist — remove that id from those peer files by hand.`
+    ? strandedByHandTail(taskId, stranded.length)
     : `No task was created and all applied peer edges were rolled back; fix the peer task ` +
       `file(s) and create the task again (it will get a new id).`;
   throw new Error(
