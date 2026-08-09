@@ -33,9 +33,13 @@ HUMAN_TASK_ID=$(cortextos bus create-task "[HUMAN] <what needs to be done>" \
 echo "HUMAN_TASK_ID=$HUMAN_TASK_ID"
 
 # 2. Block your own task on it
-cortextos bus update-task "$YOUR_TASK_ID" blocked \
-  "Blocked by human task: $HUMAN_TASK_ID" \
-  "$HUMAN_TASK_ID"
+cortextos bus update-task "$YOUR_TASK_ID" blocked --blocked-by "$HUMAN_TASK_ID"
+
+# Confirm the dependency actually landed. --blocked-by sets the real
+# task field; the log-event below is only an activity-feed annotation
+# and never created a dependency, which is why the old recipe produced
+# an invisible blocker every time it was followed.
+cortextos bus check-deps "$YOUR_TASK_ID"
 
 # 3. Notify orchestrator to surface in next briefing
 cortextos bus send-message "$CTX_ORCHESTRATOR_AGENT" normal \

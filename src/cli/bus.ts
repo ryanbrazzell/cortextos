@@ -199,7 +199,9 @@ busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
-  .action((id: string, status: string) => {
+  .option('--blocked-by <ids>', 'Comma-separated task IDs this task is blocked by (replaces the existing list; pass "" to clear)')
+  .option('--blocks <ids>', 'Comma-separated task IDs this task blocks (replaces the existing list; pass "" to clear)')
+  .action((id: string, status: string, opts: { blockedBy?: string; blocks?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -219,8 +221,19 @@ busCommand
       }
     }
 
-    updateTask(paths, id, status as TaskStatus);
-    console.log(`Updated ${id} -> ${status}`);
+    // `!== undefined`, not a truthiness test: `--blocked-by ""` is a
+    // meaningful instruction (clear the list) and an empty string is
+    // falsy, so `opts.blockedBy || ...` would silently ignore it.
+    const parseList = (raw: string) => raw.split(',').map(s => s.trim()).filter(Boolean);
+    updateTask(paths, id, status as TaskStatus, {
+      ...(opts.blockedBy !== undefined ? { blockedBy: parseList(opts.blockedBy) } : {}),
+      ...(opts.blocks !== undefined ? { blocks: parseList(opts.blocks) } : {}),
+    });
+    const edges = [
+      opts.blockedBy !== undefined ? `blocked_by=[${parseList(opts.blockedBy).join(', ')}]` : '',
+      opts.blocks !== undefined ? `blocks=[${parseList(opts.blocks).join(', ')}]` : '',
+    ].filter(Boolean).join(' ');
+    console.log(`Updated ${id} -> ${status}${edges ? ` (${edges})` : ''}`);
   });
 
 busCommand
