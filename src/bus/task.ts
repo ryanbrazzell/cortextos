@@ -160,11 +160,20 @@ export function createTask(
     throwTaskWriteFailed(taskId, err, rollbackAppliedEdges(paths, taskId, applied));
   }
 
-  // DELIBERATELY OUTSIDE the guard above, and it must stay that way. By this
-  // line the task file IS on disk. Rolling its peer edges back on an audit
-  // failure would strip the reverse edges from a task that genuinely exists
-  // and still declares those edges in its own JSON — promoting a lost audit
-  // line into real graph corruption, which is the strictly worse outcome.
+  // DELIBERATELY OUTSIDE the guard above, and it must stay that way.
+  //
+  // Accuracy note (round 6): as this file stands the hazard is not reachable —
+  // appendTaskAudit swallows its own filesystem failures, and its one uncaught
+  // call, validateTaskId, cannot reject an id this function just generated. So
+  // this placement is DEFENSIVE, not a fix for a live bug; do not read it as
+  // evidence that an audit failure has ever escaped here.
+  //
+  // It still must not move. By this line the task file IS on disk, so if that
+  // internal catch is ever narrowed or removed, a rollback wired in here would
+  // strip reverse edges from a task that genuinely exists and still declares
+  // those edges in its own JSON — promoting a lost audit line into real graph
+  // corruption. Outside the guard, that stays correct without depending on
+  // appendTaskAudit's internals, which is the weaker and safer premise.
   appendTaskAudit(paths, taskId, { event: 'create', agent: agentName, to: 'pending', note: title });
 
   return taskId;
