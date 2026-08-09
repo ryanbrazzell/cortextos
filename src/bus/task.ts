@@ -72,6 +72,8 @@ export function createTask(
   // Order is now: validate → write task → mutate peers → audit. The
   // cycle walker gets a `virtual` description of the not-yet-written
   // task so chains that pass through it are still detectable.
+  validateNewPeerIds(blockedBy, blocks);
+
   const virtualTask = { id: taskId, blocked_by: blockedBy };
   if (blockedBy.length) detectCycleOrThrow(paths, taskId, blockedBy, virtualTask);
   if (blocks.length) {
@@ -104,28 +106,65 @@ export function createTask(
   atomicWriteSync(join(paths.taskDir, `${taskId}.json`), JSON.stringify(task));
 
   // Cycle-safe now: validation already passed, so symmetric-edge
-  // maintenance is just mutating peer JSONs.
-  for (const depId of blockedBy) addSymmetricEdge(paths, depId, 'blocks', taskId);
-  for (const downId of blocks) addSymmetricEdge(paths, downId, 'blocked_by', taskId);
+  // maintenance is just mutating peer JSONs. A peer that cannot be
+  // written is still reported — see throwIfEdgesFailed.
+  const edgeFailures: string[] = [];
+  for (const depId of blockedBy) {
+    const outcome = addSymmetricEdge(paths, depId, 'blocks', taskId);
+    if (!outcome.ok) edgeFailures.push(outcome.reason);
+  }
+  for (const downId of blocks) {
+    const outcome = addSymmetricEdge(paths, downId, 'blocked_by', taskId);
+    if (!outcome.ok) edgeFailures.push(outcome.reason);
+  }
 
   appendTaskAudit(paths, taskId, { event: 'create', agent: agentName, to: 'pending', note: title });
+
+  throwIfEdgesFailed(taskId, edgeFailures);
 
   return taskId;
 }
 
 /**
+ * Outcome of one peer-edge mutation. A missing peer counts as `ok`: a
+ * dangling reference is legal here (detectCycleOrThrow calls it "not a
+ * cycle, just a dangling ref" and checkTaskDependencies reports it as
+ * `missing`). Anything else — an unreadable, corrupt or unwritable peer
+ * file — is a real failure the caller MUST NOT report as success.
+ */
+type EdgeOutcome = { ok: true } | { ok: false; reason: string };
+
+const edgeFailure = (taskId: string, err: unknown): EdgeOutcome => ({
+  ok: false,
+  reason: `${taskId} (${err instanceof Error ? err.message : String(err)})`,
+});
+
+/**
  * Mutate an existing task to add an edge to its blocks/blocked_by list.
  * No-op if the peer id is already present. Used to maintain symmetric
  * edges when a new task declares its dependencies.
+ *
+ * Returns an outcome rather than swallowing: a half-applied edge leaves
+ * an ASYMMETRIC graph, and the swallowed-removal case leaves a stale
+ * reverse edge that reads as a live dependency and pins the peer against
+ * compaction indefinitely. Reporting success over that is the exact
+ * silent-failure class this module is meant to eliminate.
  */
 function addSymmetricEdge(
   paths: BusPaths,
   taskId: string,
   field: 'blocks' | 'blocked_by',
   peerId: string,
-): void {
-  const filePath = findTaskFile(paths, taskId);
-  if (!filePath) return; // Peer task missing — surfaced at resolution time.
+): EdgeOutcome {
+  let filePath: string | null;
+  // findTaskFile validates the id and THROWS on a malformed one, so it has
+  // to be inside the guard too — it used to sit outside and escape.
+  try {
+    filePath = findTaskFile(paths, taskId);
+  } catch (err) {
+    return edgeFailure(taskId, err);
+  }
+  if (!filePath) return { ok: true }; // Peer task missing — surfaced at resolution time.
   try {
     const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
     const list = normalizeEdgeList(task[field]);
@@ -133,7 +172,10 @@ function addSymmetricEdge(
       task[field] = [...list, peerId];
       atomicWriteSync(filePath, JSON.stringify(task));
     }
-  } catch { /* best-effort */ }
+    return { ok: true };
+  } catch (err) {
+    return edgeFailure(taskId, err);
+  }
 }
 
 /**
@@ -148,18 +190,64 @@ function removeSymmetricEdge(
   taskId: string,
   field: 'blocks' | 'blocked_by',
   peerId: string,
-): void {
-  const filePath = findTaskFile(paths, taskId);
-  if (!filePath) return;
+): EdgeOutcome {
+  let filePath: string | null;
+  try {
+    filePath = findTaskFile(paths, taskId);
+  } catch (err) {
+    return edgeFailure(taskId, err);
+  }
+  if (!filePath) return { ok: true };
   try {
     const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
     const list = normalizeEdgeList(task[field]);
-    if (!list.includes(peerId)) return;
+    if (!list.includes(peerId)) return { ok: true };
     const next = list.filter(id => id !== peerId);
     if (next.length) task[field] = next;
     else delete task[field];
     atomicWriteSync(filePath, JSON.stringify(task));
-  } catch { /* best-effort */ }
+    return { ok: true };
+  } catch (err) {
+    return edgeFailure(taskId, err);
+  }
+}
+
+/**
+ * Reject malformed peer ids BEFORE any file is written.
+ *
+ * The cycle walk resolves every `blocked_by` id as it walks, so that
+ * direction was validated incidentally. Nothing ever resolves a `blocks`
+ * id — the walk starts at the task itself and returns via the `virtual`
+ * short-circuit — so an invalid downstream id first reached findTaskFile
+ * (and its validateTaskId throw) during peer maintenance, i.e. AFTER the
+ * task file had already been committed. That left the rejected dependency
+ * on disk with no audit entry, from a command that reported failure.
+ *
+ * Only ids the CALLER supplied are checked. Ids already on disk are left
+ * alone deliberately: failing the whole update on a pre-existing malformed
+ * edge would make a hand-corrupted task impossible to repair through the
+ * very command you would use to repair it.
+ */
+function validateNewPeerIds(...lists: Array<string[] | undefined>): void {
+  for (const list of lists) {
+    if (!list) continue;
+    for (const id of list) validateTaskId(id);
+  }
+}
+
+/**
+ * Turn collected peer-edge failures into one loud, actionable error.
+ * Called AFTER the audit entry is appended: the task's own write really
+ * did happen, so suppressing its audit record would trade one silent
+ * inconsistency for another.
+ */
+function throwIfEdgesFailed(taskId: string, failures: string[]): void {
+  if (!failures.length) return;
+  throw new Error(
+    `Task ${taskId} was written, but ${failures.length} symmetric edge update(s) failed: ` +
+    `${failures.join('; ')}. The dependency graph is now ASYMMETRIC and needs repair — ` +
+    `fix the peer task file(s) and re-run this command.`,
+  );
 }
 
 /**
@@ -322,6 +410,10 @@ export function updateTask(
   const { blockedBy, blocks } = options;
   const editsEdges = blockedBy !== undefined || blocks !== undefined;
 
+  // Before ANY write: a malformed peer id must fail the command outright,
+  // not surface from inside peer maintenance after the task is committed.
+  validateNewPeerIds(blockedBy, blocks);
+
   let prevStatus: TaskStatus | undefined;
   let assignee: string | undefined;
   let oldBlockedBy: string[] = [];
@@ -365,24 +457,29 @@ export function updateTask(
   // Peer maintenance only after the cycle check passed and the task
   // itself is written. Replacing a list means retiring the reverse
   // edges it dropped, not just adding the new ones.
+  const edgeFailures: string[] = [];
+  const record = (outcome: EdgeOutcome) => { if (!outcome.ok) edgeFailures.push(outcome.reason); };
+
   if (blockedBy !== undefined) {
     for (const depId of blockedBy.filter(id => !oldBlockedBy.includes(id))) {
-      addSymmetricEdge(paths, depId, 'blocks', taskId);
+      record(addSymmetricEdge(paths, depId, 'blocks', taskId));
     }
     for (const depId of oldBlockedBy.filter(id => !blockedBy.includes(id))) {
-      removeSymmetricEdge(paths, depId, 'blocks', taskId);
+      record(removeSymmetricEdge(paths, depId, 'blocks', taskId));
     }
   }
   if (blocks !== undefined) {
     for (const downId of blocks.filter(id => !oldBlocks.includes(id))) {
-      addSymmetricEdge(paths, downId, 'blocked_by', taskId);
+      record(addSymmetricEdge(paths, downId, 'blocked_by', taskId));
     }
     for (const downId of oldBlocks.filter(id => !blocks.includes(id))) {
-      removeSymmetricEdge(paths, downId, 'blocked_by', taskId);
+      record(removeSymmetricEdge(paths, downId, 'blocked_by', taskId));
     }
   }
 
   appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
+
+  throwIfEdgesFailed(taskId, edgeFailures);
 }
 
 /**

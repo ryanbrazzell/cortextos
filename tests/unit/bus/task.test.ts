@@ -981,3 +981,151 @@ describe('string-shaped blocked_by (hand-edited task JSON) is not shredded into 
     expect(report.skipped.find(s => s.id === blocker)?.reason).toMatch(/blocked_by chain/);
   });
 });
+
+describe('edge maintenance is atomic and never silently partial (PR #36 review, HIGH 1 + HIGH 2)', () => {
+  let testDir: string;
+  let paths: BusPaths;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-edgefail-test-'));
+    paths = {
+      ctxRoot: testDir,
+      inbox: join(testDir, 'inbox', 'x'),
+      inflight: join(testDir, 'inflight', 'x'),
+      processed: join(testDir, 'processed', 'x'),
+      logDir: join(testDir, 'logs', 'x'),
+      stateDir: join(testDir, 'state', 'x'),
+      taskDir: join(testDir, 'tasks'),
+      approvalDir: join(testDir, 'approvals'),
+      analyticsDir: join(testDir, 'analytics'),
+      heartbeatDir: join(testDir, 'heartbeats'),
+    };
+  });
+
+  afterEach(() => { rmSync(testDir, { recursive: true, force: true }); });
+
+  const read = (id: string) => JSON.parse(readFileSync(join(paths.taskDir, `${id}.json`), 'utf-8'));
+  const corrupt = (id: string) => writeFileSync(join(paths.taskDir, `${id}.json`), '{not json');
+
+  // ---- HIGH 2: an invalid peer id must be rejected BEFORE the self write ----
+  //
+  // The cycle walk resolves each `blocked_by` id as it walks, so that
+  // direction is validated incidentally. Nothing ever resolves a `blocks`
+  // id — the walk starts at [taskId] — so it first reached findTaskFile
+  // (and its validateTaskId throw) during peer maintenance, i.e. AFTER the
+  // self file had already been committed.
+
+  it('rejects an invalid --blocks id and leaves ZERO partial state on disk', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const before = read(work);
+
+    expect(() => updateTask(paths, work, 'blocked', { blocks: ['../../../etc/passwd'] }))
+      .toThrow(/Invalid task id/);
+
+    // The rejected dependency must NOT be on disk, and the status must not
+    // have moved. Both of these failed before the fix.
+    expect(read(work).blocks).toBeUndefined();
+    expect(read(work).status).toBe('pending');
+    expect(read(work).updated_at).toBe(before.updated_at);
+    // A rejected command must not claim a transition in the audit log.
+    expect(readTaskAudit(paths, work).filter(e => e.event === 'update')).toEqual([]);
+  });
+
+  it('rejects an invalid --blocked-by id and leaves ZERO partial state on disk', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+
+    expect(() => updateTask(paths, work, 'blocked', { blockedBy: ['../../../etc/shadow'] }))
+      .toThrow(/Invalid task id/);
+
+    expect(read(work).blocked_by).toBeUndefined();
+    expect(read(work).status).toBe('pending');
+    expect(readTaskAudit(paths, work).filter(e => e.event === 'update')).toEqual([]);
+  });
+
+  it('createTask rejects an invalid --blocks id and leaves ZERO state on disk', () => {
+    // A decoy first, so taskDir exists and the count below measures the
+    // rejected create rather than the absence of the directory.
+    createTask(paths, 'alice', 'acme', 'Decoy');
+    const jsonCount = () => readdirSync(paths.taskDir).filter(f => f.endsWith('.json')).length;
+    const before = jsonCount();
+
+    expect(() => createTask(paths, 'alice', 'acme', 'Work', { blocks: ['../../../etc/passwd'] }))
+      .toThrow(/Invalid task id/);
+
+    // Same guarantee the cycle-rejection regression test pins: a rejected
+    // create leaves no task json behind.
+    expect(jsonCount()).toBe(before);
+  });
+
+  // ---- HIGH 1: a failed peer write must never report success ----
+
+  it('reports failure when the peer write fails while ADDING an edge', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    corrupt(blocker); // peer JSON unreadable -> its `blocks` edge cannot be written
+
+    // Before the fix this returned normally: the self task recorded the
+    // dependency, the peer never got the reverse edge, and the command
+    // reported success over a now-asymmetric graph.
+    expect(() => updateTask(paths, work, 'blocked', { blockedBy: [blocker] }))
+      .toThrow(/asymmetric|edge/i);
+
+    expect(read(work).blocked_by).toEqual([blocker]);
+  });
+
+  it('reports failure when the peer write fails while REMOVING an edge', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    updateTask(paths, work, 'blocked', { blockedBy: [blocker] });
+    expect(read(blocker).blocks).toEqual([work]);
+
+    corrupt(blocker);
+
+    // This is the damaging direction: a swallowed REMOVAL leaves a stale
+    // reverse edge that reads as a live dependency and pins the peer
+    // against compaction indefinitely.
+    expect(() => updateTask(paths, work, 'in_progress', { blockedBy: [] }))
+      .toThrow(/asymmetric|edge/i);
+  });
+
+  it('still records the status transition it actually made when a peer write fails', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    corrupt(blocker);
+
+    expect(() => updateTask(paths, work, 'blocked', { blockedBy: [blocker] })).toThrow();
+
+    // The self write DID happen, so the audit must not lie by omission.
+    expect(read(work).status).toBe('blocked');
+    const updates = readTaskAudit(paths, work).filter(e => e.event === 'update');
+    expect(updates).toHaveLength(1);
+    expect(updates[0].to).toBe('blocked');
+  });
+
+  // ---- Preservation: a dangling ref is NOT a failure ----
+
+  it('PRESERVES dangling-reference tolerance: a missing peer is not an error', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+
+    // Well-formed id that resolves to nothing. detectCycleOrThrow calls this
+    // "not a cycle, just a dangling ref" and checkTaskDependencies reports it
+    // as missing — so it must stay a successful update, not become a throw.
+    expect(() => updateTask(paths, work, 'blocked', { blockedBy: ['task_1700000000_00000001'] }))
+      .not.toThrow();
+
+    expect(read(work).blocked_by).toEqual(['task_1700000000_00000001']);
+    expect(checkTaskDependencies(paths, work)).toEqual([
+      { id: 'task_1700000000_00000001', status: 'missing' },
+    ]);
+  });
+
+  it('PRESERVES the happy path: a well-formed edit still writes both sides', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+
+    expect(() => updateTask(paths, work, 'blocked', { blockedBy: [blocker] })).not.toThrow();
+
+    expect(read(work).blocked_by).toEqual([blocker]);
+    expect(read(blocker).blocks).toEqual([work]);
+  });
+});
