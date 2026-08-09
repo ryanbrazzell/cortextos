@@ -1,4 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+
+// Lets ONE test force an id collision (see the round-4 block at the end of
+// this file). Defaults to the real implementation, so every other test in
+// here keeps its normal unique ids — a blanket mock would make them collide
+// with each other, which is the opposite of what we want.
+const forced = vi.hoisted(() => ({ digits: null as string | null }));
+vi.mock('../../../src/utils/random', async importOriginal => {
+  const actual = await importOriginal<typeof import('../../../src/utils/random')>();
+  return { ...actual, randomDigits: (n: number) => forced.digits ?? actual.randomDigits(n) };
+});
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
@@ -1289,5 +1299,67 @@ describe('recovery is real: a retry after a peer failure repairs the graph (roun
     expect(msg).toContain(blocker);
     expect(msg).toMatch(/add/i);
     expect(msg).toMatch(/blocks/);
+  });
+});
+
+describe('rollback removes only what it inserted (round 4 HIGH: id collision)', () => {
+  let testDir: string;
+  let paths: BusPaths;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-collide-test-'));
+    paths = {
+      ctxRoot: testDir,
+      inbox: join(testDir, 'inbox', 'x'),
+      inflight: join(testDir, 'inflight', 'x'),
+      processed: join(testDir, 'processed', 'x'),
+      logDir: join(testDir, 'logs', 'x'),
+      stateDir: join(testDir, 'state', 'x'),
+      taskDir: join(testDir, 'tasks'),
+      approvalDir: join(testDir, 'approvals'),
+      analyticsDir: join(testDir, 'analytics'),
+      heartbeatDir: join(testDir, 'heartbeats'),
+    };
+  });
+
+  afterEach(() => {
+    forced.digits = null;
+    vi.restoreAllMocks();
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  const read = (id: string) => JSON.parse(readFileSync(join(paths.taskDir, `${id}.json`), 'utf-8'));
+
+  it('a colliding id does NOT let a failed create delete a real pre-existing edge', () => {
+    // Setup tasks keep REAL unique ids. Freezing the clock/digits up here
+    // instead would give all three the same id and collapse the fixture into
+    // a self-cycle that never reaches the code under test.
+    const existing = createTask(paths, 'alice', 'acme', 'Existing task E');
+    const peer = createTask(paths, 'alice', 'acme', 'Peer P', { blocks: [existing] });
+    // P legitimately blocks E, written by a DIFFERENT call than the one below.
+    expect(read(peer).blocks).toContain(existing);
+
+    const corrupt = createTask(paths, 'alice', 'acme', 'Corrupt peer');
+    writeFileSync(join(paths.taskDir, `${corrupt}.json`), '{not json');
+
+    // NOW force the next generated id to collide with `existing`, by replaying
+    // its exact epoch and digits. Eight random digits make this rare, not
+    // impossible, and the generator does no existence check — this module has
+    // already had a same-millisecond collision in CI.
+    const [, epoch, digits] = existing.split('_');
+    forced.digits = digits;
+    vi.spyOn(Date, 'now').mockReturnValue(Number(epoch));
+
+    // This create generates the SAME id as `existing`. Adding it to P.blocks
+    // is a no-op because P already blocks that id — but the edge is not ours.
+    expect(() =>
+      createTask(paths, 'bob', 'acme', 'Colliding', { blockedBy: [peer], blocks: [corrupt] }),
+    ).toThrow();
+
+    // Recording no-ops as "applied" made rollback delete P's real edge to E —
+    // and because it was the only entry, the field vanished entirely. Asserted
+    // as an exact list so the failure reads as the lost edge, not as a
+    // toContain() misuse against undefined.
+    expect(read(peer).blocks).toEqual([existing]);
   });
 });

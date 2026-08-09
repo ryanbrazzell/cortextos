@@ -96,20 +96,27 @@ export function createTask(
   // task as unblocked. Re-running mints a DIFFERENT id, adding a second
   // edge beside the stranded one instead of replacing it.
   //
-  // Rollback is unconditionally safe precisely because the id is fresh: no
-  // pre-existing state can legitimately reference it, so removing it from a
-  // peer can never discard an edge we did not just write.
+  // Rollback removes ONLY edges this call actually inserted (`changed`), not
+  // every edge it found in place. An earlier version recorded no-ops too and
+  // justified it with "the id is fresh, so nothing can already reference it".
+  // That argument rests on uniqueness the generator does not provide — the id
+  // is `task_<epoch_ms>_<8 random digits>` with no existence check, and this
+  // module has already seen a same-millisecond collision in CI. On a collision
+  // the no-op branch is reachable against a REAL pre-existing edge belonging
+  // to the colliding task, and blanket rollback would delete it. Tracking the
+  // mutation instead makes rollback correct without depending on the id being
+  // unique at all, which is the weaker and therefore safer premise.
   const edgeFailures: string[] = [];
   const applied: Array<{ peerId: string; field: 'blocks' | 'blocked_by' }> = [];
   for (const depId of blockedBy) {
     const outcome = addSymmetricEdge(paths, depId, 'blocks', taskId);
-    if (outcome.ok) applied.push({ peerId: depId, field: 'blocks' });
-    else edgeFailures.push(outcome.reason);
+    if (!outcome.ok) edgeFailures.push(outcome.reason);
+    else if (outcome.changed) applied.push({ peerId: depId, field: 'blocks' });
   }
   for (const downId of blocks) {
     const outcome = addSymmetricEdge(paths, downId, 'blocked_by', taskId);
-    if (outcome.ok) applied.push({ peerId: downId, field: 'blocked_by' });
-    else edgeFailures.push(outcome.reason);
+    if (!outcome.ok) edgeFailures.push(outcome.reason);
+    else if (outcome.changed) applied.push({ peerId: downId, field: 'blocked_by' });
   }
   if (edgeFailures.length) {
     edgeFailures.push(...rollbackAppliedEdges(paths, taskId, applied));
@@ -153,7 +160,7 @@ export function createTask(
  * `missing`). Anything else — an unreadable, corrupt or unwritable peer
  * file — is a real failure the caller MUST NOT report as success.
  */
-type EdgeOutcome = { ok: true } | { ok: false; reason: string };
+type EdgeOutcome = { ok: true; changed: boolean } | { ok: false; reason: string };
 
 const edgeFailure = (
   taskId: string,
@@ -194,15 +201,19 @@ function addSymmetricEdge(
   } catch (err) {
     return edgeFailure(taskId, 'add', field, err);
   }
-  if (!filePath) return { ok: true }; // Peer task missing — surfaced at resolution time.
+  // Peer task missing — surfaced at resolution time. `changed: false`: there
+  // is no file, so nothing was inserted and there is nothing to roll back.
+  if (!filePath) return { ok: true, changed: false };
   try {
     const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
     const list = normalizeEdgeList(task[field]);
-    if (!list.includes(peerId)) {
-      task[field] = [...list, peerId];
-      atomicWriteSync(filePath, JSON.stringify(task));
-    }
-    return { ok: true };
+    // `changed` reports whether THIS call inserted the edge. An edge that was
+    // already present is a no-op, and a caller rolling back must not remove
+    // it: it belongs to whatever put it there, not to us.
+    if (list.includes(peerId)) return { ok: true, changed: false };
+    task[field] = [...list, peerId];
+    atomicWriteSync(filePath, JSON.stringify(task));
+    return { ok: true, changed: true };
   } catch (err) {
     return edgeFailure(taskId, 'add', field, err);
   }
@@ -227,16 +238,16 @@ function removeSymmetricEdge(
   } catch (err) {
     return edgeFailure(taskId, 'remove', field, err);
   }
-  if (!filePath) return { ok: true };
+  if (!filePath) return { ok: true, changed: false };
   try {
     const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
     const list = normalizeEdgeList(task[field]);
-    if (!list.includes(peerId)) return { ok: true };
+    if (!list.includes(peerId)) return { ok: true, changed: false };
     const next = list.filter(id => id !== peerId);
     if (next.length) task[field] = next;
     else delete task[field];
     atomicWriteSync(filePath, JSON.stringify(task));
-    return { ok: true };
+    return { ok: true, changed: true };
   } catch (err) {
     return edgeFailure(taskId, 'remove', field, err);
   }
