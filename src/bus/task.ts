@@ -259,11 +259,24 @@ export function findTaskFile(paths: BusPaths, taskId: string): string | null {
  * Update a task's status. Matches bash update-task.sh behavior, with the
  * cross-org fallback from findTaskFile so an assignee in one org can drive
  * the lifecycle of a task filed by an orchestrator in a sibling org.
+ *
+ * `note` records WHY the task is moving to this status. Without it, a task
+ * parked in `blocked` is indistinguishable from one stuck for an unknown
+ * reason, and the next session either re-derives the blocker from scratch
+ * or treats the stale status as authoritative long after it cleared.
+ *
+ * The note is written in two places, for two different readers: onto the
+ * task as `status_note` (the current reason, what `list-tasks` shows) and
+ * into the append-only audit log (the historical reason, which survives
+ * later transitions). A transition with no note CLEARS `status_note` —
+ * the field describes the current status only, so unblocking a task must
+ * not leave its unblock condition sitting there looking live.
  */
 export function updateTask(
   paths: BusPaths,
   taskId: string,
   status: TaskStatus,
+  note?: string,
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -279,12 +292,17 @@ export function updateTask(
     prevStatus = task.status;
     assignee = task.assigned_to;
     task.status = status;
+    if (note) {
+      task.status_note = note;
+    } else {
+      delete task.status_note;
+    }
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
-  appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
+  appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status, note });
 }
 
 /**
