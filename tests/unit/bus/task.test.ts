@@ -823,3 +823,161 @@ describe('compactTasks — semantic compaction of old completed tasks', () => {
     expect(existsSync(join(paths.taskDir, `${id}.json`))).toBe(true);
   });
 });
+
+describe('updateTask dependency editing (--blocked-by / --blocks)', () => {
+  let testDir: string;
+  let paths: BusPaths;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-updatedeps-test-'));
+    paths = {
+      ctxRoot: testDir,
+      inbox: join(testDir, 'inbox', 'x'),
+      inflight: join(testDir, 'inflight', 'x'),
+      processed: join(testDir, 'processed', 'x'),
+      logDir: join(testDir, 'logs', 'x'),
+      stateDir: join(testDir, 'state', 'x'),
+      taskDir: join(testDir, 'tasks'),
+      approvalDir: join(testDir, 'approvals'),
+      analyticsDir: join(testDir, 'analytics'),
+      heartbeatDir: join(testDir, 'heartbeats'),
+    };
+  });
+
+  afterEach(() => { rmSync(testDir, { recursive: true, force: true }); });
+
+  const read = (id: string) => JSON.parse(readFileSync(join(paths.taskDir, `${id}.json`), 'utf-8'));
+
+  it('sets blocked_by on an EXISTING task and writes the symmetric blocks edge', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const blocker = createTask(paths, 'alice', 'acme', 'Human step');
+
+    updateTask(paths, work, 'blocked', { blockedBy: [blocker] });
+
+    // The whole point of the gap: this used to be unreachable from the CLI.
+    expect(read(work).blocked_by).toEqual([blocker]);
+    expect(read(work).status).toBe('blocked');
+    // Symmetric reverse edge, same as create-task maintains.
+    expect(read(blocker).blocks).toEqual([work]);
+    // And the dependency is now actually visible to the resolver.
+    expect(checkTaskDependencies(paths, work).map(d => d.id)).toEqual([blocker]);
+  });
+
+  it('replacing the list retires the reverse edge on the dropped peer', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const first = createTask(paths, 'alice', 'acme', 'First');
+    const second = createTask(paths, 'alice', 'acme', 'Second');
+
+    updateTask(paths, work, 'blocked', { blockedBy: [first] });
+    updateTask(paths, work, 'blocked', { blockedBy: [second] });
+
+    expect(read(work).blocked_by).toEqual([second]);
+    expect(read(second).blocks).toEqual([work]);
+    // A stale reverse edge here would pin `first` against compaction forever.
+    expect(read(first).blocks).toBeUndefined();
+  });
+
+  it('an empty list clears the field and unblocks the task', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    updateTask(paths, work, 'blocked', { blockedBy: [blocker] });
+    // Anchor the precondition: without it this test passes vacuously
+    // against a build that ignores the option entirely, because an
+    // edge that was never set is also an edge that reads as cleared.
+    expect(read(work).blocked_by).toEqual([blocker]);
+
+    updateTask(paths, work, 'in_progress', { blockedBy: [] });
+
+    expect(read(work).blocked_by).toBeUndefined();
+    expect(read(blocker).blocks).toBeUndefined();
+    expect(checkTaskDependencies(paths, work)).toEqual([]);
+  });
+
+  it('rejects a dependency cycle and leaves the task file unchanged', () => {
+    const a = createTask(paths, 'alice', 'acme', 'A');
+    const b = createTask(paths, 'alice', 'acme', 'B', { blockedBy: [a] });
+
+    // a blocked_by b would close the loop a -> b -> a.
+    expect(() => updateTask(paths, a, 'blocked', { blockedBy: [b] })).toThrow(/cycle/i);
+
+    // Validation runs before the write, so nothing partial landed.
+    expect(read(a).blocked_by).toBeUndefined();
+    expect(read(a).status).toBe('pending');
+  });
+
+  it('the 3-argument call still works and does not disturb existing edges', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    updateTask(paths, work, 'blocked', { blockedBy: [blocker] });
+
+    updateTask(paths, work, 'in_progress');
+
+    expect(read(work).status).toBe('in_progress');
+    expect(read(work).blocked_by).toEqual([blocker]);
+  });
+});
+
+describe('string-shaped blocked_by (hand-edited task JSON) is not shredded into characters', () => {
+  let testDir: string;
+  let paths: BusPaths;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-strdep-test-'));
+    paths = {
+      ctxRoot: testDir,
+      inbox: join(testDir, 'inbox', 'x'),
+      inflight: join(testDir, 'inflight', 'x'),
+      processed: join(testDir, 'processed', 'x'),
+      logDir: join(testDir, 'logs', 'x'),
+      stateDir: join(testDir, 'state', 'x'),
+      taskDir: join(testDir, 'tasks'),
+      approvalDir: join(testDir, 'approvals'),
+      analyticsDir: join(testDir, 'analytics'),
+      heartbeatDir: join(testDir, 'heartbeats'),
+    };
+  });
+
+  afterEach(() => { rmSync(testDir, { recursive: true, force: true }); });
+
+  // Write blocked_by as a bare string, exactly as a hand-edit produces.
+  function setStringBlockedBy(id: string, blockerId: string) {
+    const p = join(paths.taskDir, `${id}.json`);
+    const t = JSON.parse(readFileSync(p, 'utf-8'));
+    t.blocked_by = blockerId; // NOT [blockerId]
+    writeFileSync(p, JSON.stringify(t));
+  }
+
+  it('checkTaskDependencies reports ONE real blocker, not one per character', () => {
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    setStringBlockedBy(work, blocker);
+
+    const open = checkTaskDependencies(paths, work);
+
+    // Before normalisation this returned 27 entries: 't','a','s','k','_',...
+    expect(open).toHaveLength(1);
+    expect(open[0].id).toBe(blocker);
+    expect(open[0].status).toBe('pending');
+  });
+
+  it('compactTasks still protects a blocker referenced as a bare string', () => {
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    const work = createTask(paths, 'alice', 'acme', 'Work');
+    setStringBlockedBy(work, blocker);
+
+    completeTask(paths, blocker, 'done');
+    const p = join(paths.taskDir, `${blocker}.json`);
+    const t = JSON.parse(readFileSync(p, 'utf-8'));
+    const ts = new Date(Date.now() - 60 * 86400_000).toISOString().replace(/\.\d{3}Z$/, 'Z');
+    t.completed_at = ts;
+    writeFileSync(p, JSON.stringify(t));
+
+    const report = compactTasks(paths, { olderThanDays: 30 });
+
+    // The damaging case: character-splitting kept the real id out of the
+    // still-needed set, so a live blocker was archived out from under an
+    // open dependent.
+    expect(report.archived).toEqual([]);
+    expect(report.skipped.find(s => s.id === blocker)?.reason).toMatch(/blocked_by chain/);
+  });
+});

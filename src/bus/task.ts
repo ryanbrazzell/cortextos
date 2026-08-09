@@ -7,6 +7,24 @@ import { validatePriority, validateTaskId } from '../utils/validate.js';
 import { logEvent } from './event.js';
 
 /**
+ * Coerce a `blocked_by`/`blocks` field to the `string[]` the type
+ * declares. Task JSON is hand-editable and was hand-edited in the
+ * field: a single id written as a bare string instead of a one-element
+ * array type-checks nowhere but parses fine, and every consumer here
+ * iterates the value directly. `for (const id of "task_123")` yields
+ * CHARACTERS, so a string-shaped blocker made `check-deps` report 27
+ * missing dependencies named "t", "a", "s", "k"... and — the damaging
+ * one — kept the real id out of compactTasks' still-needed-as-blocker
+ * set, silently defeating the guard that stops a live blocker being
+ * archived. Normalising on read makes that shape degrade to the
+ * obvious interpretation instead of shredding it.
+ */
+function normalizeEdgeList(value: string[] | string | undefined): string[] {
+  if (!value) return [];
+  return typeof value === 'string' ? [value] : value;
+}
+
+/**
  * Create a new task. Identical JSON format to bash create-task.sh.
  */
 export function createTask(
@@ -110,11 +128,37 @@ function addSymmetricEdge(
   if (!filePath) return; // Peer task missing — surfaced at resolution time.
   try {
     const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
-    const list = task[field] ?? [];
+    const list = normalizeEdgeList(task[field]);
     if (!list.includes(peerId)) {
       task[field] = [...list, peerId];
       atomicWriteSync(filePath, JSON.stringify(task));
     }
+  } catch { /* best-effort */ }
+}
+
+/**
+ * Inverse of `addSymmetricEdge`: drop `peerId` from the peer's
+ * blocks/blocked_by list. Used when an update REPLACES a dependency
+ * list — without this the old peer keeps a reverse edge pointing at a
+ * task that no longer declares it, which reads as a live dependency to
+ * compactTasks and pins the peer in place forever.
+ */
+function removeSymmetricEdge(
+  paths: BusPaths,
+  taskId: string,
+  field: 'blocks' | 'blocked_by',
+  peerId: string,
+): void {
+  const filePath = findTaskFile(paths, taskId);
+  if (!filePath) return;
+  try {
+    const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
+    const list = normalizeEdgeList(task[field]);
+    if (!list.includes(peerId)) return;
+    const next = list.filter(id => id !== peerId);
+    if (next.length) task[field] = next;
+    else delete task[field];
+    atomicWriteSync(filePath, JSON.stringify(task));
   } catch { /* best-effort */ }
 }
 
@@ -152,7 +196,7 @@ function detectCycleOrThrow(
     if (!filePath) continue; // Missing peer is not a cycle, just a dangling ref.
     try {
       const task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task;
-      if (task.blocked_by?.length) stack.push(...task.blocked_by);
+      stack.push(...normalizeEdgeList(task.blocked_by));
     } catch { /* skip */ }
   }
 }
@@ -173,7 +217,7 @@ export function checkTaskDependencies(
   let task: Task;
   try { task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task; }
   catch { return []; }
-  const deps = task.blocked_by ?? [];
+  const deps = normalizeEdgeList(task.blocked_by);
   const open: Array<{ id: string; status: TaskStatus | 'missing' }> = [];
   for (const depId of deps) {
     const depPath = findTaskFile(paths, depId);
@@ -264,6 +308,7 @@ export function updateTask(
   paths: BusPaths,
   taskId: string,
   status: TaskStatus,
+  options: { blockedBy?: string[]; blocks?: string[] } = {},
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -271,19 +316,72 @@ export function updateTask(
       `Task ${taskId} not found in any org under ${paths.ctxRoot}/orgs/`,
     );
   }
+
+  // `undefined` = leave the edge list alone; a provided array REPLACES
+  // it (same set-the-whole-list semantics as create-task's flags).
+  const { blockedBy, blocks } = options;
+  const editsEdges = blockedBy !== undefined || blocks !== undefined;
+
   let prevStatus: TaskStatus | undefined;
   let assignee: string | undefined;
+  let oldBlockedBy: string[] = [];
+  let oldBlocks: string[] = [];
   try {
     const content = readFileSync(filePath, 'utf-8');
     const task: Task = JSON.parse(content);
     prevStatus = task.status;
     assignee = task.assigned_to;
+    oldBlockedBy = normalizeEdgeList(task.blocked_by);
+    oldBlocks = normalizeEdgeList(task.blocks);
+
+    // Validate BEFORE any write, for the same reason createTask does:
+    // a rejected cycle must not leave a half-applied edge on disk. The
+    // walker reads this task's OLD list off disk when it reaches it, so
+    // hand it a `virtual` view carrying the PROPOSED list instead.
+    if (editsEdges) {
+      const nextBlockedBy = blockedBy ?? oldBlockedBy;
+      const virtual = { id: taskId, blocked_by: nextBlockedBy };
+      if (nextBlockedBy.length) detectCycleOrThrow(paths, taskId, nextBlockedBy, virtual);
+      for (const downId of blocks ?? oldBlocks) {
+        detectCycleOrThrow(paths, downId, [taskId], virtual);
+      }
+    }
+
     task.status = status;
+    if (blockedBy !== undefined) {
+      if (blockedBy.length) task.blocked_by = [...blockedBy];
+      else delete task.blocked_by;
+    }
+    if (blocks !== undefined) {
+      if (blocks.length) task.blocks = [...blocks];
+      else delete task.blocks;
+    }
     task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
     atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
+
+  // Peer maintenance only after the cycle check passed and the task
+  // itself is written. Replacing a list means retiring the reverse
+  // edges it dropped, not just adding the new ones.
+  if (blockedBy !== undefined) {
+    for (const depId of blockedBy.filter(id => !oldBlockedBy.includes(id))) {
+      addSymmetricEdge(paths, depId, 'blocks', taskId);
+    }
+    for (const depId of oldBlockedBy.filter(id => !blockedBy.includes(id))) {
+      removeSymmetricEdge(paths, depId, 'blocks', taskId);
+    }
+  }
+  if (blocks !== undefined) {
+    for (const downId of blocks.filter(id => !oldBlocks.includes(id))) {
+      addSymmetricEdge(paths, downId, 'blocked_by', taskId);
+    }
+    for (const downId of oldBlocks.filter(id => !blocks.includes(id))) {
+      removeSymmetricEdge(paths, downId, 'blocked_by', taskId);
+    }
+  }
+
   appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
 }
 
@@ -570,7 +668,7 @@ export function listTasks(
   const byId = new Map<string, Task>();
   for (const t of sorted) byId.set(t.id, t);
   const isBlocked = (t: Task): boolean => {
-    for (const depId of t.blocked_by ?? []) {
+    for (const depId of normalizeEdgeList(t.blocked_by)) {
       const dep = byId.get(depId);
       // Out-of-list deps are checked on-disk via checkTaskDependencies,
       // but the list-view only considers in-list tasks for speed.
@@ -780,14 +878,14 @@ export function compactTasks(
   const stack: string[] = [];
   for (const t of tasks) {
     if (t.status === 'completed') continue;
-    for (const blockerId of t.blocked_by ?? []) stack.push(blockerId);
+    stack.push(...normalizeEdgeList(t.blocked_by));
   }
   while (stack.length) {
     const cur = stack.pop()!;
     if (stillNeededAsBlocker.has(cur)) continue;
     stillNeededAsBlocker.add(cur);
     const parent = byId.get(cur);
-    if (parent?.blocked_by?.length) stack.push(...parent.blocked_by);
+    if (parent) stack.push(...normalizeEdgeList(parent.blocked_by));
   }
 
   for (const task of tasks) {
