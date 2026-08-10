@@ -201,7 +201,11 @@ busCommand
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
   .option('--blocked-by <ids>', 'Comma-separated task IDs this task is blocked by (replaces the existing list; pass "" to clear)')
   .option('--blocks <ids>', 'Comma-separated task IDs this task blocks (replaces the existing list; pass "" to clear)')
-  .action((id: string, status: string, opts: { blockedBy?: string; blocks?: string }) => {
+  .option('--desc <description>', 'Replace the task description (pass "" to clear)')
+  .option('--assignee <agent>', 'Reassign the task to another agent')
+  .option('--project <name>', 'Move the task to another project (e.g. backlog)')
+  .option('--priority <p>', 'Change priority (urgent, high, normal, low)')
+  .action((id: string, status: string, opts: { blockedBy?: string; blocks?: string; desc?: string; assignee?: string; project?: string; priority?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -228,10 +232,18 @@ busCommand
     updateTask(paths, id, status as TaskStatus, {
       ...(opts.blockedBy !== undefined ? { blockedBy: parseList(opts.blockedBy) } : {}),
       ...(opts.blocks !== undefined ? { blocks: parseList(opts.blocks) } : {}),
+      ...(opts.desc !== undefined ? { description: opts.desc } : {}),
+      ...(opts.assignee !== undefined ? { assigned_to: opts.assignee } : {}),
+      ...(opts.project !== undefined ? { project: opts.project } : {}),
+      ...(opts.priority !== undefined ? { priority: opts.priority as Priority } : {}),
     });
     const edges = [
       opts.blockedBy !== undefined ? `blocked_by=[${parseList(opts.blockedBy).join(', ')}]` : '',
       opts.blocks !== undefined ? `blocks=[${parseList(opts.blocks).join(', ')}]` : '',
+      opts.desc !== undefined ? 'description' : '',
+      opts.assignee !== undefined ? `assigned_to=${opts.assignee}` : '',
+      opts.project !== undefined ? `project=${opts.project}` : '',
+      opts.priority !== undefined ? `priority=${opts.priority}` : '',
     ].filter(Boolean).join(' ');
     console.log(`Updated ${id} -> ${status}${edges ? ` (${edges})` : ''}`);
   });
