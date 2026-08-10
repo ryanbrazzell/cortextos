@@ -1655,3 +1655,220 @@ describe('rotateOAuth — token distribution touches nothing but the trailing ne
     }
   });
 });
+
+describe('checkUsageApi — extra-usage spend parsing', () => {
+  /**
+   * The real, token-scrubbed response captured from the live usage API on
+   * 2026-08-10, trimmed to the fields under test. The numbers are NOT invented:
+   * 49054 minor units against a 50000 minor-unit cap, exponent 2 — i.e. $490.54
+   * of $500.00. Every assertion below is anchored to that captured payload
+   * rather than to the wording of the task that requested this work, which named
+   * a `spend.amount_minor` path the API does not have.
+   */
+  const LIVE_PAYLOAD = {
+    five_hour: { utilization: 6, limit_dollars: null, used_dollars: null, remaining_dollars: null },
+    seven_day: { utilization: 2, limit_dollars: null, used_dollars: null, remaining_dollars: null },
+    extra_usage: {
+      is_enabled: true,
+      monthly_limit: 50000,
+      used_credits: 49054,
+      utilization: 98.10799999999999,
+      currency: 'USD',
+      decimal_places: 2,
+      spend_limit_reached: false,
+    },
+    spend: {
+      used: { amount_minor: 49054, currency: 'USD', exponent: 2 },
+      limit: { amount_minor: 50000, currency: 'USD', exponent: 2 },
+      percent: 98,
+      severity: 'critical',
+      enabled: true,
+    },
+  };
+
+  it('converts the live payload to real dollars', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => LIVE_PAYLOAD });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+
+    expect(result.spend?.used).toBeCloseTo(490.54, 2);
+    expect(result.spend?.limit).toBeCloseTo(500.0, 2);
+    expect(result.spend?.remaining).toBeCloseTo(9.46, 2);
+    expect(result.spend?.currency).toBe('USD');
+    expect(result.spend?.severity).toBe('critical');
+    expect(result.spend?.enabled).toBe(true);
+    expect(result.spend?.limit_reached).toBe(false);
+    expect(result.spend?.raw).toEqual({ used_minor: 49054, limit_minor: 50000, exponent: 2 });
+  });
+
+  /**
+   * The actual regression this task exists to prevent. `used` must be the
+   * DOLLAR figure, never the minor-unit integer — reporting 49054 as dollars is
+   * the exact 100x misread that drove a week of false financial alarm, and it
+   * is invisible to a raw-JSON cross-check because the raw JSON really does say
+   * 49054. Asserting only `toBeCloseTo(490.54)` would already fail on the bug,
+   * but naming the wrong value explicitly is what makes the intent survive a
+   * future refactor.
+   */
+  it('never reports minor units as whole currency', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => LIVE_PAYLOAD });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+
+    expect(result.spend?.used).not.toBe(49054);
+    expect(result.spend?.limit).not.toBe(50000);
+    expect(result.spend?.used).toBeLessThan(1000);
+  });
+
+  it('reports utilization as a 0–1 fraction, matching the utilization fields', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => LIVE_PAYLOAD });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+
+    // Derived from the money (0.98108), not the API's rounded `percent: 98`.
+    expect(result.spend?.utilization).toBeCloseTo(0.98108, 5);
+    expect(result.spend?.utilization).not.toBeCloseTo(98.108, 3);
+  });
+
+  it('persists spend into the snapshot the CLI and dashboard read', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({ ok: true, json: async () => LIVE_PAYLOAD });
+
+    await checkUsageApi(tmpDir, { force: true });
+
+    const latest = JSON.parse(
+      readFileSync(join(tmpDir, 'state', 'usage', 'latest.json'), 'utf-8'),
+    );
+    expect(latest.spend.used).toBeCloseTo(490.54, 2);
+  });
+
+  it('falls back to the extra_usage spelling when spend is absent', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ ...LIVE_PAYLOAD, spend: null }),
+    });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+
+    expect(result.spend?.used).toBeCloseTo(490.54, 2);
+    expect(result.spend?.limit).toBeCloseTo(500.0, 2);
+  });
+
+  it('scales each money object by its OWN exponent', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...LIVE_PAYLOAD,
+        extra_usage: null,
+        spend: {
+          used: { amount_minor: 49054, currency: 'USD', exponent: 2 },
+          limit: { amount_minor: 500, currency: 'USD', exponent: 0 },
+        },
+      }),
+    });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+
+    expect(result.spend?.used).toBeCloseTo(490.54, 2);
+    expect(result.spend?.limit).toBeCloseTo(500, 2);
+  });
+
+  /**
+   * Absent beats confident-wrong. With no exponent and no decimal_places there
+   * is no way to know whether 49054 is dollars or cents, and guessing either is
+   * how the original defect reads as authoritative money.
+   */
+  it('reports nothing when the scale is unknowable', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...LIVE_PAYLOAD,
+        extra_usage: null,
+        spend: {
+          used: { amount_minor: 49054, currency: 'USD' },
+          limit: { amount_minor: 50000, currency: 'USD' },
+        },
+      }),
+    });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+
+    expect(result.spend).toBeUndefined();
+  });
+
+  it('omits spend entirely when the API reports no pool', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ five_hour: { utilization: 6 }, seven_day: { utilization: 2 } }),
+    });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+
+    expect(result.spend).toBeUndefined();
+    expect(result.five_hour_utilization).toBeCloseTo(0.06);
+  });
+
+  /**
+   * Control arm: these three fields exist in the live response and are `null` on
+   * this plan. A future change that starts trusting them would reintroduce a
+   * dollar figure sourced from a field the API does not fill.
+   */
+  it('does not source money from the null *_dollars fields', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        five_hour: { utilization: 6, limit_dollars: null, used_dollars: null },
+        seven_day: { utilization: 2, limit_dollars: null, used_dollars: null },
+      }),
+    });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+
+    expect(result.spend).toBeUndefined();
+  });
+
+  it('does not divide by zero when the cap is zero', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...LIVE_PAYLOAD,
+        extra_usage: null,
+        spend: {
+          used: { amount_minor: 0, currency: 'USD', exponent: 2 },
+          limit: { amount_minor: 0, currency: 'USD', exponent: 2 },
+          percent: 0,
+        },
+      }),
+    });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+
+    expect(result.spend?.utilization).toBe(0);
+    expect(Number.isFinite(result.spend!.utilization)).toBe(true);
+    expect(result.spend?.remaining).toBe(0);
+  });
+
+  it('flags a reached limit', async () => {
+    writeStore();
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({
+        ...LIVE_PAYLOAD,
+        extra_usage: { ...LIVE_PAYLOAD.extra_usage, spend_limit_reached: true },
+      }),
+    });
+
+    const result = await checkUsageApi(tmpDir, { force: true });
+
+    expect(result.spend?.limit_reached).toBe(true);
+  });
+});

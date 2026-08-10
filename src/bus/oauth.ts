@@ -46,11 +46,53 @@ export interface RotationLogEntry {
   seven_day_util: number;
 }
 
+/**
+ * The extra-usage (pay-as-you-go) pool, in MAJOR currency units.
+ *
+ * This is the only financial signal the usage API returns, and until now
+ * `checkUsageApi` discarded it — see the parsing note there. Agents were
+ * hand-reading the raw response instead and misreading `amount_minor` (cents)
+ * as whole dollars, a silent 100x error that survived a week because both a
+ * raw-JSON cross-check and a percentage sanity-check reproduce it.
+ *
+ * `used`/`limit` are already divided by the API's own per-object `exponent`, so
+ * they are directly printable money — no caller should ever see a minor-unit
+ * integer again. The raw minor values are kept alongside so a consumer that
+ * needs exact integer arithmetic (no float division) still has them.
+ */
+export interface UsageSpend {
+  /** Drawn from the pool, in major units (e.g. dollars). */
+  used: number;
+  /** Cap on the pool, in major units. */
+  limit: number;
+  /** Remaining headroom in major units, i.e. `limit - used`, floored at 0. */
+  remaining: number;
+  /** ISO 4217 code, e.g. "USD". */
+  currency: string;
+  /** Fraction 0–1 of the pool consumed, to match the utilization fields. */
+  utilization: number;
+  /** Severity as reported by the API ("normal" | "warning" | "critical" | …). */
+  severity?: string;
+  /** Whether the pool is switched on at all. */
+  enabled: boolean;
+  /** True once the API says the cap has actually been hit. */
+  limit_reached: boolean;
+  /** Exact minor-unit integers, for callers that must not divide. */
+  raw: { used_minor: number; limit_minor: number; exponent: number };
+}
+
 export interface UsageSnapshot {
   account: string;
   five_hour_utilization: number;
   seven_day_utilization: number;
   fetched_at: string;
+  /**
+   * Absent whenever the API omits the pool or reports it without usable money
+   * objects. Optional rather than zero-filled on purpose: `spend.used = 0` means
+   * "measured, nothing drawn", and a plan with no extra-usage pool at all must
+   * not be reported as a plan sitting comfortably at $0.00 of $0.00.
+   */
+  spend?: UsageSpend;
 }
 
 export interface UsageCache {
@@ -80,6 +122,8 @@ export interface CheckUsageResult {
   seven_day_utilization: number;
   cached: boolean;
   fetched_at: string;
+  /** See `UsageSnapshot.spend`; absent on cached entries written before this field existed. */
+  spend?: UsageSpend;
 }
 
 /** An agent whose .env could not be updated with the rotated token. */
@@ -117,6 +161,17 @@ const THRESHOLD_7D = 0.80;
 // Alert thresholds (warn before rotating)
 export const ALERT_5H = 0.80;
 export const ALERT_7D = 0.70;
+/**
+ * Display-only warn level for the extra-usage pool.
+ *
+ * Deliberately NOT wired into `rotateOAuth`'s gate. Rotation currently turns on
+ * the two utilization numbers alone, so an account can sit at 98% of its spend
+ * cap with the API calling it `severity: "critical"` and still read as healthy
+ * to the rotation logic. Whether money should gate rotation is a behavioural
+ * change to a safety mechanism and is being decided separately — this constant
+ * only decides when the CLI prints a ⚠️.
+ */
+export const ALERT_SPEND = 0.80;
 
 // --- Path helpers ---
 
@@ -416,6 +471,116 @@ function credentialMatches(cache: UsageCache, targetFp: string | undefined): boo
   return cache.credential_fp === targetFp;
 }
 
+/** A money object as the usage API sends it: an integer plus its own scale. */
+interface RawMoney {
+  amount_minor?: number | null;
+  currency?: string | null;
+  exponent?: number | null;
+}
+
+interface RawSpend {
+  used?: RawMoney | null;
+  limit?: RawMoney | null;
+  percent?: number | null;
+  severity?: string | null;
+  enabled?: boolean | null;
+  spend_limit_reached?: boolean | null;
+}
+
+interface RawExtraUsage {
+  is_enabled?: boolean | null;
+  monthly_limit?: number | null;
+  used_credits?: number | null;
+  utilization?: number | null;
+  currency?: string | null;
+  decimal_places?: number | null;
+  spend_limit_reached?: boolean | null;
+}
+
+function isFiniteNumber(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v);
+}
+
+/**
+ * Turn the API's extra-usage pool into printable money.
+ *
+ * Two shapes carry the same figures and BOTH are read, `spend` first:
+ *   spend.used.amount_minor / spend.limit.amount_minor, each with its own `exponent`
+ *   extra_usage.used_credits / monthly_limit, scaled by `decimal_places`
+ *
+ * The task that requested this named `spend.amount_minor` — that path does not
+ * exist. The money lives one level down, under `used`/`limit`, and each object
+ * carries its own exponent; nothing here assumes the two share a scale.
+ *
+ * NOTHING IS RETURNED WHEN THE SCALE IS UNKNOWN. If an amount arrives with no
+ * exponent and no `decimal_places` to stand in for it, this yields `undefined`
+ * rather than picking a plausible default. An assumed scale is exactly the
+ * defect this function exists to remove — reporting 49054 cents as "$49,054" and
+ * reporting it as "$490.54" are the same code path with a different guess, and a
+ * wrong number here reads as authoritative money. Absent beats confident-wrong.
+ *
+ * Deliberately NOT sourced from `five_hour`/`seven_day`'s `limit_dollars` /
+ * `used_dollars` / `remaining_dollars`: those fields exist in the response but
+ * are `null` on this plan, so they are a shape the API offers and does not fill.
+ */
+function parseSpend(
+  raw: RawSpend | null | undefined,
+  extra: RawExtraUsage | null | undefined,
+): UsageSpend | undefined {
+  // Prefer the exponent that ships beside the amount; `decimal_places` is the
+  // extra_usage spelling of the same thing and only stands in when absent.
+  const scaleOf = (m: RawMoney | null | undefined): number | undefined => {
+    if (isFiniteNumber(m?.exponent)) return m.exponent;
+    if (isFiniteNumber(extra?.decimal_places)) return extra.decimal_places;
+    return undefined;
+  };
+
+  const toMajor = (m: RawMoney | null | undefined): { major: number; minor: number; exponent: number } | undefined => {
+    if (!isFiniteNumber(m?.amount_minor)) return undefined;
+    const exponent = scaleOf(m);
+    if (exponent === undefined) return undefined;
+    return { major: m.amount_minor / 10 ** exponent, minor: m.amount_minor, exponent };
+  };
+
+  let used = toMajor(raw?.used);
+  let limit = toMajor(raw?.limit);
+
+  // Fallback: same numbers, extra_usage spelling.
+  if ((!used || !limit) && isFiniteNumber(extra?.decimal_places)) {
+    const exponent = extra.decimal_places;
+    if (!used && isFiniteNumber(extra?.used_credits)) {
+      used = { major: extra.used_credits / 10 ** exponent, minor: extra.used_credits, exponent };
+    }
+    if (!limit && isFiniteNumber(extra?.monthly_limit)) {
+      limit = { major: extra.monthly_limit / 10 ** exponent, minor: extra.monthly_limit, exponent };
+    }
+  }
+
+  if (!used || !limit) return undefined;
+
+  // Derived from the money rather than from the reported `percent`, because both
+  // amounts come from the same object and the reported percent is rounded to a
+  // whole number (98 against a real 98.108). The reported value is the fallback
+  // only when the cap is zero, where the ratio is undefined rather than 0/0.
+  const utilization = limit.major > 0
+    ? used.major / limit.major
+    : isFiniteNumber(raw?.percent) ? raw.percent / 100
+    : isFiniteNumber(extra?.utilization) ? extra.utilization / 100
+    : 0;
+
+  return {
+    used: used.major,
+    limit: limit.major,
+    remaining: Math.max(0, limit.major - used.major),
+    currency: raw?.used?.currency ?? raw?.limit?.currency ?? extra?.currency ?? 'USD',
+    utilization,
+    ...(typeof raw?.severity === 'string' ? { severity: raw.severity } : {}),
+    enabled: raw?.enabled ?? extra?.is_enabled ?? false,
+    limit_reached: extra?.spend_limit_reached ?? raw?.spend_limit_reached ?? false,
+    raw: { used_minor: used.minor, limit_minor: limit.minor, exponent: used.exponent },
+  };
+}
+
 /**
  * Fetch utilization from Anthropic usage API for the active account.
  * Respects 3-minute TTL cache to avoid hitting rate limits.
@@ -501,6 +666,8 @@ export async function checkUsageApi(
     seven_day_utilization?: number;
     fiveHourUtilization?: number;
     sevenDayUtilization?: number;
+    spend?: RawSpend | null;
+    extra_usage?: RawExtraUsage | null;
   };
 
   // Convert percentage points → fraction. The usage API reports utilization on a
@@ -523,6 +690,7 @@ export async function checkUsageApi(
   const sevenDay = normalize(
     data.seven_day?.utilization ?? data.seven_day_utilization ?? data.sevenDayUtilization,
   );
+  const spend = parseSpend(data.spend, data.extra_usage);
   const fetchedAt = new Date().toISOString();
 
   const snapshot: UsageSnapshot = {
@@ -530,6 +698,7 @@ export async function checkUsageApi(
     five_hour_utilization: fiveHour,
     seven_day_utilization: sevenDay,
     fetched_at: fetchedAt,
+    ...(spend ? { spend } : {}),
   };
 
   // Update cache and accounts.json utilization fields

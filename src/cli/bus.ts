@@ -18,7 +18,7 @@ import { updateCronFire, parseDurationMs, readCronState } from '../bus/cron-stat
 import { addCron, removeCron, readCrons, updateCron as updateCronDef, getCronByName, getExecutionLog } from '../bus/crons.js';
 import { nextFireFromCron } from '../daemon/cron-scheduler.js';
 import { queryKnowledgeBase, ingestKnowledgeBase, ensureKBDirs } from '../bus/knowledge-base.js';
-import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D } from '../bus/oauth.js';
+import { checkUsageApi, refreshOAuthToken, rotateOAuth, loadAccounts, ALERT_5H, ALERT_7D, ALERT_SPEND } from '../bus/oauth.js';
 import { resolvePaths } from '../utils/paths.js';
 import { resolveEnv, resolveTargetAgentDir } from '../utils/env.js';
 import { IPCClient } from '../daemon/ipc-server.js';
@@ -2568,6 +2568,28 @@ busCommand
         console.log(`Account: ${result.account}${cached}`);
         console.log(`5h utilization:  ${pct(result.five_hour_utilization)}${warn5h}`);
         console.log(`7d utilization:  ${pct(result.seven_day_utilization)}${warn7d}`);
+        // Printed as money, in major units, so nobody has to divide anything by
+        // hand. A missing pool prints an explicit "not reported" rather than
+        // nothing at all — a silently absent line reads as $0.00.
+        if (result.spend) {
+          const s = result.spend;
+          const money = (v: number) =>
+            v.toLocaleString('en-US', {
+              style: 'currency',
+              currency: s.currency,
+              currencyDisplay: 'narrowSymbol',
+            });
+          const warnSpend = s.limit_reached ? ' ⛔ LIMIT REACHED'
+            : s.utilization >= ALERT_SPEND ? ' ⚠️'
+            : '';
+          const off = s.enabled ? '' : ' (disabled)';
+          console.log(
+            `Extra usage:     ${money(s.used)} of ${money(s.limit)} ` +
+            `(${pct(s.utilization)}, ${money(s.remaining)} left)${warnSpend}${off}`,
+          );
+        } else {
+          console.log('Extra usage:     not reported by the API for this account');
+        }
         console.log(`Fetched at: ${result.fetched_at}`);
       }
     } catch (err) {
