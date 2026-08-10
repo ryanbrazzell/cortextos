@@ -201,7 +201,11 @@ busCommand
   .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
   .option('--blocked-by <ids>', 'Comma-separated task IDs this task is blocked by (replaces the existing list; pass "" to clear)')
   .option('--blocks <ids>', 'Comma-separated task IDs this task blocks (replaces the existing list; pass "" to clear)')
-  .action((id: string, status: string, opts: { blockedBy?: string; blocks?: string }) => {
+  .option('--desc <description>', 'Replace the task description (pass "" to clear)')
+  .option('--assignee <agent>', 'Reassign the task to another agent')
+  .option('--project <name>', 'Move the task to another project (e.g. backlog)')
+  .option('--priority <p>', 'Change priority (urgent, high, normal, low)')
+  .action((id: string, status: string, opts: { blockedBy?: string; blocks?: string; desc?: string; assignee?: string; project?: string; priority?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
     if (!validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
@@ -228,10 +232,18 @@ busCommand
     updateTask(paths, id, status as TaskStatus, {
       ...(opts.blockedBy !== undefined ? { blockedBy: parseList(opts.blockedBy) } : {}),
       ...(opts.blocks !== undefined ? { blocks: parseList(opts.blocks) } : {}),
+      ...(opts.desc !== undefined ? { description: opts.desc } : {}),
+      ...(opts.assignee !== undefined ? { assigned_to: opts.assignee } : {}),
+      ...(opts.project !== undefined ? { project: opts.project } : {}),
+      ...(opts.priority !== undefined ? { priority: opts.priority as Priority } : {}),
     });
     const edges = [
       opts.blockedBy !== undefined ? `blocked_by=[${parseList(opts.blockedBy).join(', ')}]` : '',
       opts.blocks !== undefined ? `blocks=[${parseList(opts.blocks).join(', ')}]` : '',
+      opts.desc !== undefined ? 'description' : '',
+      opts.assignee !== undefined ? `assigned_to=${opts.assignee}` : '',
+      opts.project !== undefined ? `project=${opts.project}` : '',
+      opts.priority !== undefined ? `priority=${opts.priority}` : '',
     ].filter(Boolean).join(' ');
     console.log(`Updated ${id} -> ${status}${edges ? ` (${edges})` : ''}`);
   });
@@ -295,8 +307,13 @@ busCommand
     console.log(`Audit log for ${id} (${entries.length} entries):`);
     for (const e of entries) {
       const transition = e.from && e.to ? `${e.from} -> ${e.to}` : e.to || '';
+      // Non-status edits carry no from/to by design, so without this the row
+      // would render as a blank column and the edit would be invisible here.
+      const changed = [...(e.fields ?? []), ...(e.edges ?? [])];
+      const edited = changed.length ? `edited ${changed.join(', ')}` : '';
       const note = e.note ? ` | ${e.note}` : '';
-      console.log(`  ${e.ts}  ${e.event.padEnd(8)}  ${e.agent.padEnd(16)}  ${transition}${note}`);
+      const detail = [transition, edited].filter(Boolean).join('  ');
+      console.log(`  ${e.ts}  ${e.event.padEnd(8)}  ${e.agent.padEnd(16)}  ${detail}${note}`);
     }
   });
 

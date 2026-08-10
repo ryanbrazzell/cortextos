@@ -559,7 +559,14 @@ export function updateTask(
   paths: BusPaths,
   taskId: string,
   status: TaskStatus,
-  options: { blockedBy?: string[]; blocks?: string[] } = {},
+  options: {
+    blockedBy?: string[];
+    blocks?: string[];
+    description?: string;
+    assigned_to?: string;
+    project?: string;
+    priority?: Priority;
+  } = {},
 ): void {
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
@@ -576,6 +583,12 @@ export function updateTask(
   // Before ANY write: a malformed peer id must fail the command outright,
   // not surface from inside peer maintenance after the task is committed.
   validateNewPeerIds(blockedBy, blocks);
+
+  // Same pre-write contract for priority. The CLI's `as Priority` cast is
+  // erased at runtime and validates nothing, so an invalid value would
+  // otherwise reach disk. Rejecting here also protects the peer writes
+  // below, which land on OTHER task files before this task is committed.
+  if (options.priority !== undefined) validatePriority(options.priority);
 
   let task: Task;
   let oldBlockedBy: string[] = [];
@@ -641,23 +654,86 @@ export function updateTask(
 
   const prevStatus = task.status;
   const assignee = task.assigned_to;
+
+  // Which scalar fields were supplied AND actually differ from disk.
+  // `--project x` on a task already in project x is a no-op, not an edit:
+  // it must not show up in the audit entry, and must not on its own cause
+  // a write. Every guard below is `!== undefined`, never truthiness —
+  // `--desc ""` is a legitimate clear and an empty string is falsy.
+  const changedFields: string[] = [];
+  if (options.description !== undefined && task.description !== options.description) changedFields.push('description');
+  if (options.assigned_to !== undefined && task.assigned_to !== options.assigned_to) changedFields.push('assigned_to');
+  if (options.project !== undefined && task.project !== options.project) changedFields.push('project');
+  if (options.priority !== undefined && task.priority !== options.priority) changedFields.push('priority');
+
+  // Edges are "supplied" whenever the flag appears, but only CHANGED when
+  // the resulting list actually differs from what is on disk.
+  // Order carries no meaning here — the add/remove helpers above operate by
+  // membership — so `--blocked-by B,A` against a stored [A,B] is a no-op,
+  // not an edit. Compare as multisets so a pure reorder neither forces a
+  // write nor advances `updated_at`.
+  const sameList = (a: string[], b: string[]) => {
+    if (a.length !== b.length) return false;
+    const x = [...a].sort();
+    const y = [...b].sort();
+    return x.every((v, i) => v === y[i]);
+  };
+  const nextBlockedBy = blockedBy ?? oldBlockedBy;
+  const nextBlocks = blocks ?? oldBlocks;
+  const blockedByChanged = !sameList(nextBlockedBy, oldBlockedBy);
+  const blocksChanged = !sameList(nextBlocks, oldBlocks);
+  const changedEdges: string[] = [];
+  if (blockedByChanged) changedEdges.push('blocked_by');
+  if (blocksChanged) changedEdges.push('blocks');
+  const edgesChanged = changedEdges.length > 0;
+
+  const statusChanged = prevStatus !== status;
+  const fieldsChanged = changedFields.length > 0;
+
   try {
-    task.status = status;
-    if (blockedBy !== undefined) {
-      if (blockedBy.length) task.blocked_by = [...blockedBy];
-      else delete task.blocked_by;
+    // Previously this block wrote unconditionally, so even a pure no-op
+    // advanced `updated_at`. Skipping the write when nothing changed keeps
+    // `updated_at` meaning "last time this task actually changed".
+    if (statusChanged || edgesChanged || fieldsChanged) {
+      task.status = status;
+      // Guarded on the PER-FIELD comparison, not merely on `!== undefined`.
+      // Entering this block is decided by the whole change set, so an
+      // unrelated `--project` edit would otherwise be enough to rewrite a
+      // reordered-but-unchanged edge list onto disk — making the stored byte
+      // order depend on an edit that has nothing to do with dependencies.
+      if (blockedBy !== undefined && blockedByChanged) {
+        if (blockedBy.length) task.blocked_by = [...blockedBy];
+        else delete task.blocked_by;
+      }
+      if (blocks !== undefined && blocksChanged) {
+        if (blocks.length) task.blocks = [...blocks];
+        else delete task.blocks;
+      }
+      if (options.description !== undefined) task.description = options.description;
+      if (options.assigned_to !== undefined) task.assigned_to = options.assigned_to;
+      if (options.project !== undefined) task.project = options.project;
+      if (options.priority !== undefined) task.priority = options.priority;
+      task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+      atomicWriteSync(filePath, JSON.stringify(task));
     }
-    if (blocks !== undefined) {
-      if (blocks.length) task.blocks = [...blocks];
-      else delete task.blocks;
-    }
-    task.updated_at = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
-    atomicWriteSync(filePath, JSON.stringify(task));
   } catch (err) {
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
 
-  appendTaskAudit(paths, taskId, { event: 'update', agent: assignee || 'unknown', from: prevStatus, to: status });
+  // NO non-status edit may forge a `pending -> pending` transition that reads
+  // as real lifecycle work in the audit log — that applies to edge edits just
+  // as much as to scalar ones. `from`/`to` are emitted when the status
+  // changed, and for a pure no-op to preserve the previous behavior.
+  // `fields`/`edges` name what actually moved, so dropping the forged
+  // transition never leaves an entry that says nothing at all.
+  const entry: Omit<TaskAuditEntry, 'ts'> = { event: 'update', agent: assignee || 'unknown' };
+  if (statusChanged || (!fieldsChanged && !edgesChanged)) {
+    entry.from = prevStatus;
+    entry.to = status;
+  }
+  if (fieldsChanged) entry.fields = [...changedFields];
+  if (edgesChanged) entry.edges = [...changedEdges];
+  appendTaskAudit(paths, taskId, entry);
 }
 
 /**
@@ -672,6 +748,20 @@ export interface TaskAuditEntry {
   from?: TaskStatus;
   to?: TaskStatus;
   note?: string;
+  /**
+   * Names of the scalar fields changed by a field edit (description,
+   * assigned_to, project, priority). Present only when at least one
+   * actually changed; a field-only edit omits `from`/`to` entirely so it
+   * cannot be replayed as a status transition.
+   */
+  fields?: string[];
+  /**
+   * Names of the edge lists changed by a dependency edit (`blocked_by`,
+   * `blocks`). Same contract as `fields`: present only when the list
+   * actually changed, and an edge-only edit omits `from`/`to` so it cannot
+   * be replayed as a status transition either.
+   */
+  edges?: string[];
 }
 
 /**
