@@ -307,8 +307,13 @@ busCommand
     console.log(`Audit log for ${id} (${entries.length} entries):`);
     for (const e of entries) {
       const transition = e.from && e.to ? `${e.from} -> ${e.to}` : e.to || '';
+      // Non-status edits carry no from/to by design, so without this the row
+      // would render as a blank column and the edit would be invisible here.
+      const changed = [...(e.fields ?? []), ...(e.edges ?? [])];
+      const edited = changed.length ? `edited ${changed.join(', ')}` : '';
       const note = e.note ? ` | ${e.note}` : '';
-      console.log(`  ${e.ts}  ${e.event.padEnd(8)}  ${e.agent.padEnd(16)}  ${transition}${note}`);
+      const detail = [transition, edited].filter(Boolean).join('  ');
+      console.log(`  ${e.ts}  ${e.event.padEnd(8)}  ${e.agent.padEnd(16)}  ${detail}${note}`);
     }
   });
 

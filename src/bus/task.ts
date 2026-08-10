@@ -668,10 +668,22 @@ export function updateTask(
 
   // Edges are "supplied" whenever the flag appears, but only CHANGED when
   // the resulting list actually differs from what is on disk.
-  const sameList = (a: string[], b: string[]) => a.length === b.length && a.every((v, i) => v === b[i]);
+  // Order carries no meaning here — the add/remove helpers above operate by
+  // membership — so `--blocked-by B,A` against a stored [A,B] is a no-op,
+  // not an edit. Compare as multisets so a pure reorder neither forces a
+  // write nor advances `updated_at`.
+  const sameList = (a: string[], b: string[]) => {
+    if (a.length !== b.length) return false;
+    const x = [...a].sort();
+    const y = [...b].sort();
+    return x.every((v, i) => v === y[i]);
+  };
   const nextBlockedBy = blockedBy ?? oldBlockedBy;
   const nextBlocks = blocks ?? oldBlocks;
-  const edgesChanged = !sameList(nextBlockedBy, oldBlockedBy) || !sameList(nextBlocks, oldBlocks);
+  const changedEdges: string[] = [];
+  if (!sameList(nextBlockedBy, oldBlockedBy)) changedEdges.push('blocked_by');
+  if (!sameList(nextBlocks, oldBlocks)) changedEdges.push('blocks');
+  const edgesChanged = changedEdges.length > 0;
 
   const statusChanged = prevStatus !== status;
   const fieldsChanged = changedFields.length > 0;
@@ -701,16 +713,19 @@ export function updateTask(
     throw new Error(`Task ${taskId} update failed: ${err}`);
   }
 
-  // A field-only edit must NOT forge a `pending -> pending` transition that
-  // reads as real lifecycle work in the audit log. `from`/`to` are emitted
-  // when the status changed, and for a pure no-op to preserve the previous
-  // behavior; `fields` is emitted only when a field actually changed.
+  // NO non-status edit may forge a `pending -> pending` transition that reads
+  // as real lifecycle work in the audit log — that applies to edge edits just
+  // as much as to scalar ones. `from`/`to` are emitted when the status
+  // changed, and for a pure no-op to preserve the previous behavior.
+  // `fields`/`edges` name what actually moved, so dropping the forged
+  // transition never leaves an entry that says nothing at all.
   const entry: Omit<TaskAuditEntry, 'ts'> = { event: 'update', agent: assignee || 'unknown' };
-  if (statusChanged || !fieldsChanged) {
+  if (statusChanged || (!fieldsChanged && !edgesChanged)) {
     entry.from = prevStatus;
     entry.to = status;
   }
   if (fieldsChanged) entry.fields = [...changedFields];
+  if (edgesChanged) entry.edges = [...changedEdges];
   appendTaskAudit(paths, taskId, entry);
 }
 
@@ -733,6 +748,13 @@ export interface TaskAuditEntry {
    * cannot be replayed as a status transition.
    */
   fields?: string[];
+  /**
+   * Names of the edge lists changed by a dependency edit (`blocked_by`,
+   * `blocks`). Same contract as `fields`: present only when the list
+   * actually changed, and an edge-only edit omits `from`/`to` so it cannot
+   * be replayed as a status transition either.
+   */
+  edges?: string[];
 }
 
 /**

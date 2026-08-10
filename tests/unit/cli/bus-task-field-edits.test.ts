@@ -29,6 +29,7 @@
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { mkdirSync, rmSync, existsSync, readFileSync, writeFileSync } from 'fs';
+import { randomBytes } from 'crypto';
 import { join } from 'path';
 import { homedir } from 'os';
 import type { Task, TaskStatus, Priority } from '../../../src/types/index';
@@ -97,9 +98,9 @@ function auditPath(): string {
  * create-then-update in the same second can show an unchanged timestamp even on
  * code that rewrites it unconditionally — the seeded old value removes that.
  */
-function seedTask(overrides: Partial<Task> = {}): Task {
+function seedTask(overrides: Partial<Task> = {}, id: string = TASK_ID): Task {
   const task: Task = {
-    id: TASK_ID,
+    id,
     title: 'Seeded task',
     description: 'original description',
     type: 'agent',
@@ -119,8 +120,17 @@ function seedTask(overrides: Partial<Task> = {}): Task {
     ...overrides,
   };
   mkdirSync(taskDir, { recursive: true });
-  writeFileSync(taskPath(), JSON.stringify(task), 'utf-8');
+  writeFileSync(join(taskDir, `${id}.json`), JSON.stringify(task), 'utf-8');
   return task;
+}
+
+/**
+ * Edge edits touch the PEER task's file before the subject's own, and a
+ * missing peer is an edge failure that throws. Any edge arm therefore has to
+ * seed both ends of the relationship, already symmetric.
+ */
+function seedPeer(id: string, overrides: Partial<Task> = {}): void {
+  seedTask({ title: `Peer ${id}`, ...overrides }, id);
 }
 
 function readTask(): Task {
@@ -140,7 +150,10 @@ beforeEach(() => {
 
   // Unique per test: relocates the ENTIRE ctxRoot, including the cross-org
   // fallback scan in findTaskFile(), away from the live agent's tree.
-  instanceId = `taskedit-test-${process.pid}-${++seq}`;
+  // The random suffix is load-bearing, not decoration: two vitest workers can
+  // share a PID, so pid+seq alone collides and one worker's afterEach would
+  // recursively delete the other's live tree mid-run.
+  instanceId = `taskedit-test-${process.pid}-${++seq}-${randomBytes(4).toString('hex')}`;
   ctxRoot = join(homedir(), '.cortextos', instanceId);
   taskDir = join(ctxRoot, 'orgs', TEST_ORG, 'tasks');
 
@@ -341,6 +354,51 @@ describe('bus update-task — audit matrix', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Edge edits get the SAME audit contract as scalar edits. Applying the
+// no-forged-transition rule to scalar fields only would leave the rule half
+// stated: an edge-only edit would still write `pending -> pending`.
+// ---------------------------------------------------------------------------
+
+describe('bus update-task — edge edits are not status transitions either', () => {
+  it('edge-only edit emits `edges` with `from` and `to` both ABSENT', async () => {
+    mockExit();
+    seedTask({ status: 'pending', blocked_by: ['task_a'] });
+    seedPeer('task_a', { blocks: [TASK_ID] });
+    seedPeer('task_b');
+
+    await runUpdate(TASK_ID, 'pending', '--blocked-by', 'task_b');
+
+    expect(readTask().blocked_by).toEqual(['task_b']);
+    const e = readAudit()[0];
+    expect(e.edges).toEqual(['blocked_by']);
+    // The whole point of the change: a dependency edit is not lifecycle work.
+    expect(e).not.toHaveProperty('from');
+    expect(e).not.toHaveProperty('to');
+  });
+
+  it('REORDERING an edge list is a no-op — no write, no `edges`', async () => {
+    mockExit();
+    const pinned = '2020-01-01T00:00:00Z';
+    seedTask({ status: 'pending', blocked_by: ['task_a', 'task_b'], updated_at: pinned });
+    seedPeer('task_a', { blocks: [TASK_ID] });
+    seedPeer('task_b', { blocks: [TASK_ID] });
+    atomicSpy.mockClear();
+
+    // Same set, different order. Peer maintenance is membership-based and
+    // already does nothing here; the subject's own write must match.
+    await runUpdate(TASK_ID, 'pending', '--blocked-by', 'task_b,task_a');
+
+    expect(atomicSpy).not.toHaveBeenCalled();
+    expect(readTask().updated_at).toBe(pinned);
+    const e = readAudit()[0];
+    expect(e).not.toHaveProperty('edges');
+    // A pure no-op keeps from/to, matching the bare status-only no-op arm.
+    expect(e.from).toBe('pending');
+    expect(e.to).toBe('pending');
+  });
+});
+
+// ---------------------------------------------------------------------------
 // No-op behaviour — the user-visible change that ships with this feature.
 // ---------------------------------------------------------------------------
 
@@ -382,6 +440,33 @@ describe('bus update-task — no-op does not write', () => {
     expect(e.to).toBe('pending');
     expect(e).not.toHaveProperty('fields');
     expect(atomicSpy).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Dropping the forged transition makes `from`/`to` absent for non-status
+// edits, and the formatted reader renders that column from from/to alone.
+// Without the reader change, a field edit prints an entry with a BLANK detail
+// column — the edit becomes invisible in the one view humans actually read.
+// ---------------------------------------------------------------------------
+
+describe('bus task-history — a non-status edit is not a blank row', () => {
+  it('names the changed field instead of rendering an empty transition', async () => {
+    mockExit();
+    seedTask({ status: 'pending' });
+    await runUpdate(TASK_ID, 'pending', '--project', 'backlog');
+
+    // Spy AFTER the update so update-task's own success line is excluded.
+    const lines: string[] = [];
+    const logSpy = vi.spyOn(console, 'log').mockImplementation((...a: unknown[]) => {
+      lines.push(a.map(String).join(' '));
+    });
+    await busCommand.parseAsync(['task-history', TASK_ID], { from: 'user' });
+    logSpy.mockRestore();
+
+    const row = lines.find((l) => l.includes('update'));
+    expect(row).toBeDefined();
+    expect(row).toContain('edited project');
   });
 });
 
