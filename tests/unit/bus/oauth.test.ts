@@ -1699,7 +1699,12 @@ describe('checkUsageApi — extra-usage spend parsing', () => {
     expect(result.spend?.severity).toBe('critical');
     expect(result.spend?.enabled).toBe(true);
     expect(result.spend?.limit_reached).toBe(false);
-    expect(result.spend?.raw).toEqual({ used_minor: 49054, limit_minor: 50000, exponent: 2 });
+    expect(result.spend?.raw).toEqual({
+      used_minor: 49054,
+      used_exponent: 2,
+      limit_minor: 50000,
+      limit_exponent: 2,
+    });
   });
 
   /**
@@ -1776,6 +1781,17 @@ describe('checkUsageApi — extra-usage spend parsing', () => {
 
     expect(result.spend?.used).toBeCloseTo(490.54, 2);
     expect(result.spend?.limit).toBeCloseTo(500, 2);
+
+    // The raw contract must survive differing scales too. Asserting only the
+    // major fields above is what let `raw` carry both integers under a single
+    // exponent: a caller applying used's exponent 2 to limit_minor 500 decodes
+    // the cap as $5.00 instead of $500.00. Found by adversarial review, 2026-08-10.
+    expect(result.spend?.raw).toEqual({
+      used_minor: 49054,
+      used_exponent: 2,
+      limit_minor: 500,
+      limit_exponent: 0,
+    });
   });
 
   /**

@@ -77,8 +77,20 @@ export interface UsageSpend {
   enabled: boolean;
   /** True once the API says the cap has actually been hit. */
   limit_reached: boolean;
-  /** Exact minor-unit integers, for callers that must not divide. */
-  raw: { used_minor: number; limit_minor: number; exponent: number };
+  /**
+   * Exact minor-unit integers, for callers that must not divide. Each amount
+   * carries its OWN exponent: the API models `used` and `limit` as independent
+   * money objects and nothing guarantees they share a scale. A single shared
+   * exponent here would hand a caller the cap's integer under the used amount's
+   * scale — reintroducing, in the raw contract, the exact minor/major confusion
+   * this type exists to remove.
+   */
+  raw: {
+    used_minor: number;
+    used_exponent: number;
+    limit_minor: number;
+    limit_exponent: number;
+  };
 }
 
 export interface UsageSnapshot {
@@ -577,7 +589,12 @@ function parseSpend(
     ...(typeof raw?.severity === 'string' ? { severity: raw.severity } : {}),
     enabled: raw?.enabled ?? extra?.is_enabled ?? false,
     limit_reached: extra?.spend_limit_reached ?? raw?.spend_limit_reached ?? false,
-    raw: { used_minor: used.minor, limit_minor: limit.minor, exponent: used.exponent },
+    raw: {
+      used_minor: used.minor,
+      used_exponent: used.exponent,
+      limit_minor: limit.minor,
+      limit_exponent: limit.exponent,
+    },
   };
 }
 
