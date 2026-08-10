@@ -680,9 +680,11 @@ export function updateTask(
   };
   const nextBlockedBy = blockedBy ?? oldBlockedBy;
   const nextBlocks = blocks ?? oldBlocks;
+  const blockedByChanged = !sameList(nextBlockedBy, oldBlockedBy);
+  const blocksChanged = !sameList(nextBlocks, oldBlocks);
   const changedEdges: string[] = [];
-  if (!sameList(nextBlockedBy, oldBlockedBy)) changedEdges.push('blocked_by');
-  if (!sameList(nextBlocks, oldBlocks)) changedEdges.push('blocks');
+  if (blockedByChanged) changedEdges.push('blocked_by');
+  if (blocksChanged) changedEdges.push('blocks');
   const edgesChanged = changedEdges.length > 0;
 
   const statusChanged = prevStatus !== status;
@@ -694,11 +696,16 @@ export function updateTask(
     // `updated_at` meaning "last time this task actually changed".
     if (statusChanged || edgesChanged || fieldsChanged) {
       task.status = status;
-      if (blockedBy !== undefined) {
+      // Guarded on the PER-FIELD comparison, not merely on `!== undefined`.
+      // Entering this block is decided by the whole change set, so an
+      // unrelated `--project` edit would otherwise be enough to rewrite a
+      // reordered-but-unchanged edge list onto disk — making the stored byte
+      // order depend on an edit that has nothing to do with dependencies.
+      if (blockedBy !== undefined && blockedByChanged) {
         if (blockedBy.length) task.blocked_by = [...blockedBy];
         else delete task.blocked_by;
       }
-      if (blocks !== undefined) {
+      if (blocks !== undefined && blocksChanged) {
         if (blocks.length) task.blocks = [...blocks];
         else delete task.blocks;
       }

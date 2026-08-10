@@ -396,6 +396,24 @@ describe('bus update-task — edge edits are not status transitions either', () 
     expect(e.from).toBe('pending');
     expect(e.to).toBe('pending');
   });
+
+  it('a reorder RIDING ALONG with a real field edit still does not reach disk', async () => {
+    mockExit();
+    seedTask({ status: 'pending', blocked_by: ['task_a', 'task_b'], project: 'original-project' });
+    seedPeer('task_a', { blocks: [TASK_ID] });
+    seedPeer('task_b', { blocks: [TASK_ID] });
+
+    // The write block IS entered — project genuinely changes. The edge list
+    // must not be rewritten just because something else brought us in here.
+    await runUpdate(TASK_ID, 'pending', '--blocked-by', 'task_b,task_a', '--project', 'backlog');
+
+    const t = readTask();
+    expect(t.project).toBe('backlog');
+    expect(t.blocked_by).toEqual(['task_a', 'task_b']);
+    const e = readAudit()[0];
+    expect(e.fields).toEqual(['project']);
+    expect(e).not.toHaveProperty('edges');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -467,6 +485,10 @@ describe('bus task-history — a non-status edit is not a blank row', () => {
     const row = lines.find((l) => l.includes('update'));
     expect(row).toBeDefined();
     expect(row).toContain('edited project');
+    // Containment alone would pass a renderer that ALSO prints the forged
+    // transition, which is the defect the audit change exists to remove.
+    expect(row).not.toContain('pending -> pending');
+    expect(row).not.toContain('|');
   });
 });
 
