@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # pre-push hook — installed by scripts/setup-hooks.sh
 #
+# cortextos-hook-version: 2
+#
 # Runs npm run build && npm test before any push.
 # Fails the push if either step fails, so broken code never reaches CI.
 #
@@ -13,8 +15,138 @@ set -euo pipefail
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
 
+# Refuse to gate code we are not actually testing.
+#
+# This hook tests the WORKING TREE: it runs `npm test` on whatever is checked
+# out. Git supplies the refs actually being pushed on stdin, which this hook
+# previously never read. The two are only the same thing when the branch being
+# pushed is HEAD. Push some other branch — e.g. `git push fork other-branch`
+# from a worktree sitting on your own branch — and the suite happily tests your
+# branch, reports green, and pushes code it never looked at. Two different
+# branches pushed from one worktree produce byte-identical results.
+#
+# A gate that passes on code it never ran is worse than no gate, because the
+# green check stops anyone from looking twice. So: read the refs, and require
+# every pushed commit to be the one we are about to test. Testing each pushed
+# ref properly would mean a detached worktree per ref; refusing is the cheap
+# honest alternative — it makes the guarantee true rather than broad.
+#
+# Deletions are exempt: there is no code to test.
+# Stdin is consumed here rather than left for npm/vitest to inherit.
+#
+# The `-t 0` guard: git always pipes this hook's stdin, never a terminal. A
+# terminal on stdin therefore means someone is hand-running the hook, where a
+# bare `read` would block on the keyboard and look like a hang. Skip the check
+# there — and note that a hand-run consequently proves nothing about ref
+# gating, which is the general reason not to verify a hook by hand-running it.
+HEAD_SHA="$(git rev-parse HEAD)"
+mismatched=()
+while [[ ! -t 0 ]] && read -r local_ref local_sha remote_ref remote_sha; do
+  [[ -z "${local_ref:-}" ]] && continue           # deletion: no local ref
+  [[ "$local_sha" =~ ^0+$ ]] && continue          # deletion: all-zero sha
+  # Peel to a commit before comparing. For an annotated tag, git sends the TAG
+  # OBJECT's id, which never equals `rev-parse HEAD` even when the tag points
+  # exactly at the checked-out commit — so a raw comparison rejects a push it
+  # should have allowed. Fall back to the raw value if it will not peel.
+  local_commit="$(git rev-parse --quiet --verify "$local_sha^{commit}" 2>/dev/null || echo "$local_sha")"
+  [[ "$local_commit" == "$HEAD_SHA" ]] && continue   # this is what we test
+  mismatched+=("$local_ref @ ${local_sha:0:12}")
+done
+
+if [[ ${#mismatched[@]} -gt 0 ]]; then
+  echo "" >&2
+  echo "[pre-push] Refusing: you are pushing refs that are not your checked-out HEAD." >&2
+  echo "[pre-push] This hook tests the working tree, so it would test HEAD and tell you" >&2
+  echo "[pre-push] nothing about:" >&2
+  for _m in "${mismatched[@]}"; do echo "[pre-push]     $_m" >&2; done
+  echo "[pre-push]" >&2
+  echo "[pre-push] HEAD is ${HEAD_SHA:0:12}. Check the branch out and push from there:" >&2
+  echo "[pre-push]     git worktree add ../wt-<name> <branch> && cd ../wt-<name> && git push" >&2
+  echo "[pre-push] Push aborted." >&2
+  exit 1
+fi
+
+# Preflight: the test suite needs BOTH dependency trees installed.
+#
+# `npm test` is a single vitest run spanning the root suite and dashboard/. CI
+# installs both (ci.yml runs `npm ci` then `npm ci --prefix dashboard`), but a
+# fresh clone that only ran `npm install`, and every `git worktree` — which git
+# creates without any node_modules at all — has the dashboard tree missing.
+#
+# Left unguarded that surfaces as 12 file-level load failures ("Cannot find
+# package 'next/server'", and 'better-sqlite3' via dashboard/src/lib/db.ts) plus
+# one assertion failure in tests/integration/phase5-e2e-simulation.test.ts,
+# which catches the failed dynamic import of the dashboard route handlers and
+# fails an assertion instead of dying at import. That reads as "1 real failing
+# test among 12 unrelated errors" when it is one missing install — so the
+# cheapest way out looks like --no-verify, which disables this gate entirely.
+# Measured 2026-08-08 at f7b6be2: identical suite, deps present -> 2097 passed,
+# exit 0; deps absent -> 12 failed files / 1 failed test, exit 1.
+#
+# So: name the actual cause before running anything, and print the one command
+# that fixes it.
+#
+# Ask Node to RESOLVE the packages rather than checking that directories exist.
+# A directory check is a proxy for the real property and gets both directions
+# wrong: `dashboard/node_modules/next/` can exist while the install is empty or
+# half-written (passes, then fails cryptically anyway), and a legitimately
+# hoisted layout that resolves from the root tree has no dashboard directory at
+# all (fails, while the suite would have run fine). require.resolve is the same
+# question vitest will ask, so it cannot disagree with the run that follows.
+# `node -e` resolves relative to the current directory, hence the subshell cd.
+resolves_from() { ( cd "$1" && node -e 'require.resolve(process.argv[1])' "$2" ) >/dev/null 2>&1; }
+
+missing_deps=()
+resolves_from . vitest || missing_deps+=("root: npm ci")
+if ! resolves_from dashboard next || ! resolves_from dashboard better-sqlite3; then
+  missing_deps+=("dashboard: npm ci --prefix dashboard")
+fi
+
+if [[ ${#missing_deps[@]} -gt 0 ]]; then
+  echo "" >&2
+  echo "[pre-push] Refusing: dependencies the test suite needs are not installed." >&2
+  echo "[pre-push] Running the suite now would fail with module-resolution errors" >&2
+  echo "[pre-push] that look like broken tests but are not." >&2
+  echo "[pre-push]" >&2
+  for _d in "${missing_deps[@]}"; do echo "[pre-push]     $_d" >&2; done
+  echo "[pre-push]" >&2
+  echo "[pre-push] In a git worktree, symlinking the primary checkout's trees is faster:" >&2
+  echo "[pre-push]     bash scripts/link-worktree-deps.sh" >&2
+  echo "[pre-push] Push aborted." >&2
+  exit 1
+fi
+
+# Run build and tests in CI's environment, not the caller's.
+#
+# Two families of ambient env vars leak into vitest subprocesses and cause
+# failures CI never reproduces, aborting pushes over green code:
+#
+#   CTX_*  A live cortextOS agent session exports CTX_AGENT_DIR,
+#          CTX_PROJECT_ROOT and CTX_FRAMEWORK_ROOT. The sandbox/live isolation
+#          guard in src/utils/env.ts (issue #313) then sees a CTX_FRAMEWORK_ROOT
+#          the test overrode alongside a CTX_AGENT_DIR it did not, and throws.
+#
+#   GIT_*  git itself exports GIT_DIR, GIT_INDEX_FILE and friends when it
+#          invokes a hook. Tests that shell out to git in a temp repo inherit
+#          them and operate on THIS repo's gitdir and index instead of their own
+#          fixture. This one only reproduces under `git push` — running the hook
+#          by hand leaves GIT_* unset and looks green.
+#
+# Both are the same defect class: ambient env inherited by a subprocess that
+# assumed a clean one. CI has neither, so strip both and match it. Enumerated by
+# prefix rather than by name so a var added later is covered without editing
+# this file. The scrub applies only to build/test — the `git rev-parse` above
+# deliberately still sees GIT_DIR so it resolves the right worktree.
+env_scrub=()
+for _v in ${!CTX_@} ${!GIT_@}; do env_scrub+=(-u "$_v"); done
+run_clean() { env ${env_scrub[@]+"${env_scrub[@]}"} "$@"; }
+
+if [[ ${#env_scrub[@]} -gt 0 ]]; then
+  echo "[pre-push] Scrubbing ${#env_scrub[@]} ambient CTX_*/GIT_* var(s) from the build/test environment."
+fi
+
 echo "[pre-push] Running build..."
-if ! npm run build --silent; then
+if ! run_clean npm run build --silent; then
   echo ""
   echo "[pre-push] Build failed. Fix the error before pushing." >&2
   echo "[pre-push] Push aborted." >&2
@@ -22,7 +154,7 @@ if ! npm run build --silent; then
 fi
 
 echo "[pre-push] Running tests..."
-if ! npm test --silent; then
+if ! run_clean npm test --silent; then
   echo ""
   echo "[pre-push] Tests failed. Fix the failing tests before pushing." >&2
   echo "[pre-push] Push aborted." >&2
