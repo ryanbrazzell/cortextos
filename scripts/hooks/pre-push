@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # pre-push hook — installed by scripts/setup-hooks.sh
 #
-# cortextos-hook-version: 2
+# cortextos-hook-version: 3
 #
 # Runs npm run build && npm test before any push.
 # Fails the push if either step fails, so broken code never reaches CI.
@@ -62,6 +62,55 @@ if [[ ${#mismatched[@]} -gt 0 ]]; then
   echo "[pre-push]" >&2
   echo "[pre-push] HEAD is ${HEAD_SHA:0:12}. Check the branch out and push from there:" >&2
   echo "[pre-push]     git worktree add ../wt-<name> <branch> && cd ../wt-<name> && git push" >&2
+  echo "[pre-push] Push aborted." >&2
+  exit 1
+fi
+
+# Refuse to build a DIRTY PRIMARY checkout, because here the build is the deploy.
+#
+# `npm run build` below writes $REPO_ROOT/dist. dist/ is gitignored and there is
+# no separate install step, so the live cortextos CLI simply IS whatever sits in
+# the primary checkout's dist. tsup compiles the working tree, not HEAD. Pushing
+# from a dirty primary checkout therefore builds the uncommitted changes on disk
+# and ships them — a `git push` silently deploying code nobody chose to release,
+# and code that is by definition not the reviewed commit being pushed.
+#
+# Scoped to the PRIMARY checkout deliberately. In a linked worktree the same
+# build writes that worktree's own dist, which nothing runs, so a dirty worktree
+# is harmless. Refusing there too would fire on the normal way to do isolated
+# work, and a hook that refuses routinely is precisely how a fleet learns to
+# type --no-verify — which switches off every guard in this file, not just this
+# one. That failure already happened here once (see the dep preflight below).
+#
+# Only TRACKED modifications count. Untracked files are the steady state of a
+# working checkout (scratch scripts, logs, editor droppings) and tsup will not
+# compile one unless something tracked already imports it, in which case the
+# import itself is a tracked change. Blocking on untracked files would be noise
+# for no safety, and noise is what erodes the gate.
+#
+# Comparing --absolute-git-dir against a normalized --git-common-dir is what
+# distinguishes the two: git reports them equal in a primary checkout and
+# different in a linked worktree. --git-common-dir can come back relative, so
+# it is resolved to an absolute path before comparing or the check would think
+# every primary checkout was a worktree and never fire.
+GIT_DIR_ABS="$(git rev-parse --absolute-git-dir)"
+GIT_COMMON_ABS="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
+if [[ "$GIT_DIR_ABS" == "$GIT_COMMON_ABS" ]] && ! git diff --quiet HEAD -- 2>/dev/null; then
+  echo "" >&2
+  echo "[pre-push] Refusing: the primary checkout has uncommitted tracked changes." >&2
+  echo "[pre-push]" >&2
+  echo "[pre-push] This hook runs 'npm run build', which writes $REPO_ROOT/dist." >&2
+  echo "[pre-push] dist/ is gitignored with no separate install step, so that build IS" >&2
+  echo "[pre-push] the live deploy. Building now would compile the working tree and ship" >&2
+  echo "[pre-push] these uncommitted changes, which are not the commits you are pushing:" >&2
+  echo "[pre-push]" >&2
+  git diff --name-status HEAD -- | sed 's/^/[pre-push]     /' >&2
+  echo "[pre-push]" >&2
+  echo "[pre-push] Do the push from a worktree, which builds its own throwaway dist:" >&2
+  echo "[pre-push]     git worktree add ../wt-<name> <branch>" >&2
+  echo "[pre-push]     cd ../wt-<name> && bash scripts/link-worktree-deps.sh && git push" >&2
+  echo "[pre-push]" >&2
+  echo "[pre-push] Or commit/stash the changes above first, so the build matches HEAD." >&2
   echo "[pre-push] Push aborted." >&2
   exit 1
 fi
