@@ -26,7 +26,26 @@ git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
 # a bare repo, or a relocated gitdir it silently names an unrelated directory and
 # we would link dependencies in from somewhere arbitrary. In
 # `git worktree list --porcelain` the first record is always the main worktree.
-PRIMARY="$(git worktree list --porcelain | awk '/^worktree /{print substr($0,10); exit}')"
+#
+# Capture the full listing into a variable and parse that, rather than piping
+# into a reader that stops at the first record. Under `set -o pipefail` an early
+# `exit` in the reader closes the pipe while git is still writing, git takes
+# SIGPIPE, and the assignment fails with 141 — which `set -e` turns into a
+# silent abort *before* the first echo, so the script looks like a no-op. That
+# is a race (it needs git to still be writing), so it fires intermittently and
+# gets worse the more worktrees exist: measured 24/25 runs on a checkout with 35
+# worktrees. No pipe means no SIGPIPE, by construction rather than by timing.
+WORKTREE_LIST="$(git worktree list --porcelain)"
+case "$WORKTREE_LIST" in
+  "worktree "*)
+    PRIMARY="${WORKTREE_LIST%%$'\n'*}"
+    PRIMARY="${PRIMARY#worktree }"
+    ;;
+  *)
+    # Leave PRIMARY empty so the existing check below reports it properly.
+    PRIMARY=""
+    ;;
+esac
 HERE="$(git rev-parse --show-toplevel)"
 
 if [[ -z "$PRIMARY" ]]; then
