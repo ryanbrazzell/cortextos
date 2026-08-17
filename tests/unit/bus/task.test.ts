@@ -12,7 +12,7 @@ vi.mock('../../../src/utils/random', async importOriginal => {
 import { mkdtempSync, rmSync, readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync } from 'fs';
 import { join } from 'path';
 import { tmpdir } from 'os';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, findTaskFile, archiveTasks } from '../../../src/bus/task';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, checkTaskDependencyAnomaly, compactTasks, listTasks, findTaskFile, archiveTasks } from '../../../src/bus/task';
 import type { BusPaths } from '../../../src/types';
 
 describe('Task Management', () => {
@@ -615,6 +615,82 @@ describe('Task dependency DAG (blocks / blocked_by)', () => {
     const b = createTask(paths, 'alice', 'acme', 'B', { blockedBy: ['task_nonexistent_777'] });
     const open = checkTaskDependencies(paths, b);
     expect(open).toEqual([{ id: 'task_nonexistent_777', status: 'missing' }]);
+  });
+
+  // ---------------------------------------------------------------
+  // status=blocked with no backing edge — the false-green case.
+  // Reproduces the live 2026-08-17 incident: a task was moved to
+  // blocked with `update-task <id> blocked` (status only, no edge),
+  // and check-deps then reported it "ready to work", which would have
+  // handed it to a scheduled triage pass as actionable.
+  // ---------------------------------------------------------------
+
+  it('FALSE GREEN: status=blocked with no blocked_by edge is flagged as an anomaly', () => {
+    const t = createTask(paths, 'alice', 'acme', 'Blocked but unbacked');
+    updateTask(paths, t, 'blocked');
+
+    // The false green itself: zero open deps, so check-deps' old path
+    // printed "ready to work". This assertion pins the exact pairing —
+    // if checkTaskDependencies ever started reporting something here,
+    // the anomaly check below would be testing a different situation.
+    expect(checkTaskDependencies(paths, t)).toEqual([]);
+
+    expect(checkTaskDependencyAnomaly(paths, t)).toEqual({ kind: 'blocked_without_edge' });
+  });
+
+  it('CONTROL: status=blocked WITH a real open edge is not an anomaly', () => {
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    const t = createTask(paths, 'alice', 'acme', 'Properly blocked', { blockedBy: [blocker] });
+    updateTask(paths, t, 'blocked');
+
+    // The block is backed by something that can actually clear it.
+    expect(checkTaskDependencies(paths, t).length).toBe(1);
+    expect(checkTaskDependencyAnomaly(paths, t)).toBeNull();
+  });
+
+  it('CONTROL: a non-blocked task with no edges is not an anomaly', () => {
+    const t = createTask(paths, 'alice', 'acme', 'Ordinary pending task');
+
+    // Most tasks in the store look like this. If the detector fired
+    // here it would flag essentially every task and be ignored.
+    expect(checkTaskDependencyAnomaly(paths, t)).toBeNull();
+
+    updateTask(paths, t, 'in_progress');
+    expect(checkTaskDependencyAnomaly(paths, t)).toBeNull();
+  });
+
+  it('a bare-STRING blocked_by counts as a real edge, not an absent one', () => {
+    // This shape has reached disk before (hand-edited as a stopgap for
+    // the then-missing --blocked-by flag). It IS a backing edge; reading
+    // the field without normalizing would invent an anomaly here.
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    const t = createTask(paths, 'alice', 'acme', 'String-edged');
+    const file = join(paths.taskDir, `${t}.json`);
+    const raw = JSON.parse(readFileSync(file, 'utf-8'));
+    raw.status = 'blocked';
+    raw.blocked_by = blocker; // bare string, not an array
+    writeFileSync(file, JSON.stringify(raw));
+
+    expect(checkTaskDependencyAnomaly(paths, t)).toBeNull();
+  });
+
+  it('BOUNDARY: blocked with an edge to a COMPLETED task is deliberately NOT flagged', () => {
+    // Distinct defect, deliberately out of scope. Here the dependency
+    // genuinely IS clear, so "ready to work" is the truthful answer and
+    // only the status field is stale. The anomaly this detector exists
+    // for is a block that nothing can ever clear. Documenting the
+    // boundary so a future reader does not widen it by accident.
+    const blocker = createTask(paths, 'alice', 'acme', 'Blocker');
+    const t = createTask(paths, 'alice', 'acme', 'Stale blocked', { blockedBy: [blocker] });
+    updateTask(paths, t, 'blocked');
+    completeTask(paths, blocker, 'done');
+
+    expect(checkTaskDependencies(paths, t)).toEqual([]);
+    expect(checkTaskDependencyAnomaly(paths, t)).toBeNull();
+  });
+
+  it('a nonexistent task id yields no anomaly rather than throwing', () => {
+    expect(checkTaskDependencyAnomaly(paths, 'task_nonexistent_999')).toBeNull();
   });
 
   it('cycle detection: A blocked_by B, B blocked_by A throws at creation', () => {

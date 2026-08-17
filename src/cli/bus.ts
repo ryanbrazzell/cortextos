@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { sendMessage, checkInbox, ackInbox } from '../bus/message.js';
 import { validateAgentName, validateTaskId } from '../utils/validate.js';
-import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
+import { createTask, updateTask, completeTask, claimTask, readTaskAudit, checkTaskDependencies, checkTaskDependencyAnomaly, compactTasks, listTasks, checkStaleTasks, archiveTasks, checkHumanTasks } from '../bus/task.js';
 import { saveOutput } from '../bus/save-output.js';
 import { logEvent } from '../bus/event.js';
 import { updateHeartbeat, readAllHeartbeats } from '../bus/heartbeat.js';
@@ -280,6 +280,18 @@ busCommand
     const paths = resolvePaths(env.agentName, env.instanceId, env.org);
     const open = checkTaskDependencies(paths, id);
     if (open.length === 0) {
+      // A task marked blocked with no edge has no open dependencies in
+      // the literal sense, but reporting it as ready is what licenses a
+      // triage pass to pick up work somebody deliberately blocked.
+      // Non-zero exit so scripted callers cannot read this as green.
+      if (checkTaskDependencyAnomaly(paths, id)) {
+        console.error(`${id}: status=blocked but NO blocked_by edge — NOT ready to work.`);
+        console.error(`  The block is bookkeeping-only: nothing records what it is waiting for,`);
+        console.error(`  so no dependency completing will ever clear it.`);
+        console.error(`  Attach the real blocker:  cortextos bus update-task ${id} blocked --blocked-by <blocker-id>`);
+        process.exitCode = 1;
+        return;
+      }
       console.log(`${id}: no open dependencies — ready to work`);
       return;
     }

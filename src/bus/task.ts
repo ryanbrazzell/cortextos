@@ -484,6 +484,48 @@ export function checkTaskDependencies(
 }
 
 /**
+ * A task whose `status` is `blocked` but whose `blocked_by` list is
+ * empty. Nothing records what it is waiting for, so nothing can ever
+ * clear it — and `checkTaskDependencies` correctly reports zero open
+ * dependencies, which `check-deps` then renders as "ready to work".
+ *
+ * That is a false green in the licensing direction: it tells a triage
+ * pass to pick up a task somebody deliberately marked blocked. It is
+ * the dangerous direction of the failure, not the safe one — a false
+ * red would merely over-block.
+ *
+ * Reported separately from `checkTaskDependencies` on purpose. That
+ * function answers "which of my declared dependencies are still open",
+ * and for this task the honest answer really is "none". An unbacked
+ * block is a bookkeeping defect, not a dependency, so folding it into
+ * the dependency list would make that contract lie.
+ */
+export type TaskDependencyAnomaly = { kind: 'blocked_without_edge' };
+
+/**
+ * Detect the `status=blocked` / no-edge inconsistency described above.
+ * Returns `null` when the task is fine, missing, or unreadable —
+ * callers that want "does this task have open deps" should keep using
+ * `checkTaskDependencies`; this only answers "is the block real".
+ */
+export function checkTaskDependencyAnomaly(
+  paths: BusPaths,
+  taskId: string,
+): TaskDependencyAnomaly | null {
+  const filePath = findTaskFile(paths, taskId);
+  if (!filePath) return null;
+  let task: Task;
+  try { task = JSON.parse(readFileSync(filePath, 'utf-8')) as Task; }
+  catch { return null; }
+  if (task.status !== 'blocked') return null;
+  // normalizeEdgeList, not `.length` on the raw field: a bare-string
+  // `blocked_by` is a real shape that has reached disk before, and it
+  // IS a backing edge — reading it as absent would invent an anomaly.
+  if (normalizeEdgeList(task.blocked_by).length > 0) return null;
+  return { kind: 'blocked_without_edge' };
+}
+
+/**
  * Find the on-disk path of a task file by ID, supporting cross-org lookup.
  *
  * cortextOS's standard dispatch pattern is an orchestrator in one org
