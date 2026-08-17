@@ -794,12 +794,20 @@ export function updateTask(
   // transition never leaves an entry that says nothing at all.
   //
   // When the status was OMITTED and nothing actually changed, there is no
-  // entry to write at all: the old `(!fieldsChanged && !edgesChanged)` arm
-  // existed to preserve the audit row for an explicit status no-op, and
-  // reaching it with `status === undefined` would emit `to: undefined` — a
-  // transition to nowhere, which is precisely the forged row this guard
-  // exists to prevent. Skipping mirrors the write skip above, so a no-op
-  // retag leaves neither a new `updated_at` nor a phantom log line.
+  // entry to write at all. The `(!fieldsChanged && !edgesChanged)` arm below
+  // exists to preserve the audit row for an EXPLICIT status no-op; it is
+  // already gated on `statusSupplied`, so reaching it with
+  // `status === undefined` would NOT emit `to: undefined` — that arm simply
+  // does not fire, and `from`/`to` are left off entirely.
+  //
+  // The row it would leave is therefore not malformed but CONTENTLESS:
+  // `{ ts, event: 'update', agent }` with no `from`/`to`, no `fields`, no
+  // `changes` and no `edges` — a lifecycle entry that records nothing yet
+  // reads as real work in `task-history` and in any audit rollup. That is the
+  // forged row this guard exists to prevent. Skipping mirrors the write skip
+  // above, so a no-op retag leaves neither a new `updated_at` nor a phantom
+  // log line. Covered by the two "appends NO audit row" tests in
+  // tests/unit/bus/task-project-tagging.test.ts, which fail if this returns.
   const statusSupplied = status !== undefined;
   if (!statusSupplied && !fieldsChanged && !edgesChanged) return;
 

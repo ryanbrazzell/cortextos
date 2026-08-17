@@ -32,7 +32,13 @@ import { join } from 'path';
 import { tmpdir } from 'os';
 import { createTask, updateTask, readTaskAudit, findTaskFile } from '../../../src/bus/task';
 import { validateProject, PROJECT_NAME_MAX } from '../../../src/utils/validate';
-import type { BusPaths, TaskAuditEntry } from '../../../src/types';
+import type { BusPaths } from '../../../src/types';
+// `TaskAuditEntry` is declared and exported by src/bus/task.ts, NOT by
+// src/types. Importing it from src/types raised TS2305 (no exported member) —
+// invisible in CI because tsconfig.json excludes `tests/` and vitest erases
+// type-only imports without checking them, so the file ran green while never
+// type-checking.
+import type { TaskAuditEntry } from '../../../src/bus/task';
 
 // ---------------------------------------------------------------------------
 // The project-name grammar, unit level.
@@ -332,6 +338,44 @@ describe('project tagging (library layer)', () => {
       // error. Conflating the two would make the guard reject valid calls.
       const id = createTask(paths, 'paul', 'acme', 'Same value', { project: 'p' });
       expect(() => updateTask(paths, id, undefined, { project: 'p' })).not.toThrow();
+    });
+
+    it('appends NO audit row for a supplied-but-unchanged FIELD edit — no contentless phantom entry', () => {
+      // Guards the early return in `updateTask` that runs when the status was
+      // omitted and nothing actually changed. Delete it and this call still
+      // appends `{ ts, event: 'update', agent }`: no `from`/`to`, no `fields`,
+      // no `changes`, no `edges` — a lifecycle event recording nothing, which
+      // then reads as real work in `task-history` and in any audit rollup.
+      //
+      // Asserted on the audit CONTENTS, deliberately. The sibling test above
+      // pins only `.not.toThrow()`, and a contentless row is silent on that
+      // assertion — removing the guard throws nothing, so a no-throw check
+      // cannot distinguish "correctly skipped" from "wrote a phantom".
+      //
+      // The row is contentless rather than malformed because the `statusSupplied &&`
+      // arm on the from/to branch already prevents a `to: undefined`.
+      const id = createTask(paths, 'paul', 'acme', 'Same value', { project: 'p' });
+      expect(rows(id)).toHaveLength(0);
+
+      updateTask(paths, id, undefined, { project: 'p' });
+
+      expect(rows(id)).toHaveLength(0);
+    });
+
+    it('appends NO audit row for a supplied-but-unchanged EDGE edit either', () => {
+      // Same guard, the other arm. Re-supplying an identical `blocked_by` list
+      // is a no-op, and an edges-only call clears the argument-shape check, so
+      // it reaches the audit append with `edgesChanged === false`.
+      const blocker = createTask(paths, 'paul', 'acme', 'Blocker');
+      const work = createTask(paths, 'paul', 'acme', 'Work');
+
+      updateTask(paths, work, undefined, { blockedBy: [blocker] });
+      const afterRealEdit = rows(work).length;
+      expect(afterRealEdit).toBeGreaterThan(0); // the real edge edit DID log
+
+      updateTask(paths, work, undefined, { blockedBy: [blocker] });
+
+      expect(rows(work)).toHaveLength(afterRealEdit);
     });
 
     it("treats `description: ''` as a supplied field, not as absence", () => {
