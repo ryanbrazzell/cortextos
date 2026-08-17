@@ -3,7 +3,7 @@ import { join } from 'path';
 import type { Task, Priority, TaskStatus, BusPaths, StaleTaskReport, ArchiveReport } from '../types/index.js';
 import { atomicWriteSync, ensureDir } from '../utils/atomic.js';
 import { randomDigits } from '../utils/random.js';
-import { validatePriority, validateTaskId } from '../utils/validate.js';
+import { validatePriority, validateProject, validateTaskId } from '../utils/validate.js';
 import { logEvent } from './event.js';
 
 /**
@@ -47,7 +47,13 @@ export function createTask(
     description = '',
     assignee = agentName,
     priority = 'normal',
-    project = '',
+    // Defaults to 'backlog', not ''. An untagged task is invisible to every
+    // project-scoped query, so the old '' default silently accumulated work
+    // nobody was filtering for — the queue-governance rule that new findings
+    // land in `backlog` was stated in the docs but never enforced by the code
+    // that creates them. Naming the default here makes the documented rule the
+    // actual behaviour; callers that want a different project still pass one.
+    project = 'backlog',
     needsApproval = false,
     dueDate = '',
     blockedBy = [],
@@ -55,6 +61,10 @@ export function createTask(
   } = options;
 
   validatePriority(priority);
+  // Before the id is generated or anything touches disk, for the same reason
+  // validatePriority runs here: a rejected value must not leave a partially
+  // created task behind.
+  validateProject(project);
 
   const epoch = Date.now();
   // 8 digits: same-millisecond collision probability is ~1e-8 instead of ~1e-3.
@@ -558,7 +568,11 @@ export function findTaskFile(paths: BusPaths, taskId: string): string | null {
 export function updateTask(
   paths: BusPaths,
   taskId: string,
-  status: TaskStatus,
+  // Optional. A field edit is a first-class operation, so retagging a task no
+  // longer requires restating a status it is not changing — which was not just
+  // clumsy but lossy: the caller had to know the current status, and passing a
+  // stale one silently rewrote it.
+  status?: TaskStatus,
   options: {
     blockedBy?: string[];
     blocks?: string[];
@@ -568,6 +582,23 @@ export function updateTask(
     priority?: Priority;
   } = {},
 ): void {
+  // Argument-shape check first: it depends on nothing on disk, and a caller
+  // that supplied no instruction at all is a bug at the call site rather than
+  // a no-op to absorb. Running it before the lookup also guarantees the
+  // failure cannot be mistaken for "the task changed".
+  const editsAnyField =
+    options.blockedBy !== undefined ||
+    options.blocks !== undefined ||
+    options.description !== undefined ||
+    options.assigned_to !== undefined ||
+    options.project !== undefined ||
+    options.priority !== undefined;
+  if (status === undefined && !editsAnyField) {
+    throw new Error(
+      `Task ${taskId} update failed: nothing to update — pass a status or at least one field to change.`
+    );
+  }
+
   const filePath = findTaskFile(paths, taskId);
   if (!filePath) {
     throw new Error(
@@ -589,6 +620,10 @@ export function updateTask(
   // otherwise reach disk. Rejecting here also protects the peer writes
   // below, which land on OTHER task files before this task is committed.
   if (options.priority !== undefined) validatePriority(options.priority);
+  // Same pre-write contract for project, and for a sharper reason: an
+  // unvalidated project name reaches single-line output where an embedded line
+  // terminator can forge a whole extra row. See validateProject.
+  if (options.project !== undefined) validateProject(options.project);
 
   let task: Task;
   let oldBlockedBy: string[] = [];
@@ -666,6 +701,31 @@ export function updateTask(
   if (options.project !== undefined && task.project !== options.project) changedFields.push('project');
   if (options.priority !== undefined && task.priority !== options.priority) changedFields.push('priority');
 
+  // Before/after values for the short scalar fields, captured HERE because the
+  // write block below overwrites `task` in place — read them afterwards and
+  // every "from" would equal its "to".
+  //
+  // `fields` alone says a project changed but not what it changed FROM, so a
+  // mis-retag cannot be undone from the log; that is the one thing an audit
+  // trail exists to answer. Recorded inside the existing `update` event rather
+  // than as a separate event type, so there is still exactly one encoding of
+  // "a field edit happened".
+  //
+  // `description` is deliberately EXCLUDED: it is unbounded free text, and
+  // copying both versions into an append-only log on every edit would let one
+  // task's history outgrow every other file in the tree. `fields` still
+  // reports that it changed. An untagged task reads as '' here, which is the
+  // real stored value, not a placeholder.
+  const AUDITED_VALUE_FIELDS = ['assigned_to', 'project', 'priority'] as const;
+  const fieldChanges: Record<string, { from: string; to: string }> = {};
+  for (const name of AUDITED_VALUE_FIELDS) {
+    if (!changedFields.includes(name)) continue;
+    fieldChanges[name] = {
+      from: String(task[name] ?? ''),
+      to: String(options[name] ?? ''),
+    };
+  }
+
   // Edges are "supplied" whenever the flag appears, but only CHANGED when
   // the resulting list actually differs from what is on disk.
   // Order carries no meaning here — the add/remove helpers above operate by
@@ -687,7 +747,10 @@ export function updateTask(
   if (blocksChanged) changedEdges.push('blocks');
   const edgesChanged = changedEdges.length > 0;
 
-  const statusChanged = prevStatus !== status;
+  // An OMITTED status is not a change to compare — without the `!== undefined`
+  // guard, `prevStatus !== undefined` is true for every field-only edit, which
+  // would both force a write and forge a status transition in the audit log.
+  const statusChanged = status !== undefined && prevStatus !== status;
   const fieldsChanged = changedFields.length > 0;
 
   try {
@@ -695,7 +758,10 @@ export function updateTask(
     // advanced `updated_at`. Skipping the write when nothing changed keeps
     // `updated_at` meaning "last time this task actually changed".
     if (statusChanged || edgesChanged || fieldsChanged) {
-      task.status = status;
+      // Guarded: a field-only edit leaves the status exactly as stored.
+      // Assigning unconditionally would write `undefined` into the status of
+      // every task retagged without one.
+      if (status !== undefined) task.status = status;
       // Guarded on the PER-FIELD comparison, not merely on `!== undefined`.
       // Entering this block is decided by the whole change set, so an
       // unrelated `--project` edit would otherwise be enough to rewrite a
@@ -726,12 +792,32 @@ export function updateTask(
   // changed, and for a pure no-op to preserve the previous behavior.
   // `fields`/`edges` name what actually moved, so dropping the forged
   // transition never leaves an entry that says nothing at all.
+  //
+  // When the status was OMITTED and nothing actually changed, there is no
+  // entry to write at all. The `(!fieldsChanged && !edgesChanged)` arm below
+  // exists to preserve the audit row for an EXPLICIT status no-op; it is
+  // already gated on `statusSupplied`, so reaching it with
+  // `status === undefined` would NOT emit `to: undefined` — that arm simply
+  // does not fire, and `from`/`to` are left off entirely.
+  //
+  // The row it would leave is therefore not malformed but CONTENTLESS:
+  // `{ ts, event: 'update', agent }` with no `from`/`to`, no `fields`, no
+  // `changes` and no `edges` — a lifecycle entry that records nothing yet
+  // reads as real work in `task-history` and in any audit rollup. That is the
+  // forged row this guard exists to prevent. Skipping mirrors the write skip
+  // above, so a no-op retag leaves neither a new `updated_at` nor a phantom
+  // log line. Covered by the two "appends NO audit row" tests in
+  // tests/unit/bus/task-project-tagging.test.ts, which fail if this returns.
+  const statusSupplied = status !== undefined;
+  if (!statusSupplied && !fieldsChanged && !edgesChanged) return;
+
   const entry: Omit<TaskAuditEntry, 'ts'> = { event: 'update', agent: assignee || 'unknown' };
-  if (statusChanged || (!fieldsChanged && !edgesChanged)) {
+  if (statusChanged || (statusSupplied && !fieldsChanged && !edgesChanged)) {
     entry.from = prevStatus;
     entry.to = status;
   }
   if (fieldsChanged) entry.fields = [...changedFields];
+  if (Object.keys(fieldChanges).length) entry.changes = fieldChanges;
   if (edgesChanged) entry.edges = [...changedEdges];
   appendTaskAudit(paths, taskId, entry);
 }
@@ -755,6 +841,17 @@ export interface TaskAuditEntry {
    * cannot be replayed as a status transition.
    */
   fields?: string[];
+  /**
+   * Before/after values for the short scalar fields named in `fields`
+   * (`assigned_to`, `project`, `priority`), so a wrong edit can be identified
+   * and reversed from the log alone rather than only detected. Keyed by field
+   * name; present only when at least one of those fields changed.
+   *
+   * `description` is intentionally absent — it is unbounded free text and
+   * storing both versions per edit would let one task's append-only history
+   * grow without limit. `fields` still records that it changed.
+   */
+  changes?: Record<string, { from: string; to: string }>;
   /**
    * Names of the edge lists changed by a dependency edit (`blocked_by`,
    * `blocks`). Same contract as `fields`: present only when the list
