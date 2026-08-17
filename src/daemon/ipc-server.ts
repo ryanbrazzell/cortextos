@@ -742,8 +742,12 @@ export class IPCServer {
           if (!agentToReload) {
             response = { success: false, error: 'reload-crons requires agent name' };
           } else {
-            // crons.json was already written atomically by the CLI — acknowledge the reload.
-            // CronScheduler picks up the change on its next 30s tick.
+            // crons.json was already written atomically by the CLI. This call is
+            // what actually makes the change live: CronScheduler re-reads the file
+            // only from start() and reload(), and tick() dispatches from the
+            // definition already cached in memory. There is no periodic re-read,
+            // so if this signal never arrives the daemon keeps firing the OLD
+            // prompt until it restarts.
             this.agentManager.reloadCrons(agentToReload);
             response = { success: true, data: `Crons reloaded for ${agentToReload}` };
           }

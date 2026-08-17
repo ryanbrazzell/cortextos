@@ -1997,14 +1997,58 @@ function fmtTs(iso: string | undefined): string {
 }
 
 /**
- * Send a reload-crons IPC signal to the daemon (non-blocking, best-effort).
- * Silently swallows errors — the daemon will pick up changes on its next tick.
+ * Ask the running daemon to reload this agent's crons.
+ *
+ * There is NO periodic re-read to fall back on. `CronScheduler` calls
+ * `loadCrons()` from exactly two places — `start()` and `reload()` — and
+ * `tick()` fires from the `sc.definition` it already holds in memory. So a
+ * signal that does not land is not "picked up later": the running daemon keeps
+ * dispatching the OLD prompt until it is restarted or successfully signalled.
+ *
+ * The comments this replaces promised pickup "on the next 30s tick" and
+ * swallowed the failure, so a dropped signal was an indefinite silent no-op
+ * while the CLI still printed success — and the documented remedy was to wait
+ * for a tick that never comes. (The real 30s cache is `ipc-server.ts`'s status
+ * cache, which has nothing to do with cron definitions.)
+ *
+ * Note that `IPCClient.send()` RESOLVES rather than rejects when the daemon is
+ * down (ECONNREFUSED/ENOENT become `{ success: false }`), so the failure has to
+ * be read off the response as well as caught — a try/catch alone misses the
+ * single most common case.
+ *
+ * @returns null when the daemon acknowledged the reload, otherwise the reason.
  */
-async function signalCronReload(agentName: string, instanceId: string): Promise<void> {
+async function signalCronReload(agentName: string, instanceId: string): Promise<string | null> {
   try {
     const ipc = new IPCClient(instanceId);
-    await ipc.send({ type: 'reload-crons', agent: agentName, source: 'cortextos bus cron-cmd' });
-  } catch { /* non-fatal — scheduler picks up file change on next 30s tick */ }
+    const response = await ipc.send({
+      type: 'reload-crons',
+      agent: agentName,
+      source: 'cortextos bus cron-cmd',
+    });
+    if (!response.success) {
+      return response.error ?? 'daemon rejected the reload without giving a reason';
+    }
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
+}
+
+/**
+ * Report a reload signal that did not land. The crons.json write already
+ * succeeded by this point, so this is a warning about LIVENESS, not about
+ * persistence — say which, or the operator re-runs a write that was never the
+ * problem.
+ */
+function warnCronReloadFailed(agentName: string, reason: string): void {
+  console.warn(
+    `Warning: crons.json was saved, but the daemon was not signalled (${reason}).\n` +
+      `  The scheduler does not re-read crons.json on a timer, so a running daemon is\n` +
+      `  still using the previous definition. The change applies once the daemon starts\n` +
+      `  or restarts; to apply it to an already-running daemon, re-run this command when\n` +
+      `  the daemon is reachable, or check: cortextos bus list-crons ${agentName}`
+  );
 }
 
 busCommand
@@ -2048,8 +2092,9 @@ busCommand
       process.exit(1);
     }
 
-    await signalCronReload(agent, env.instanceId);
+    const addReloadError = await signalCronReload(agent, env.instanceId);
     console.log(`Added cron '${name}' for ${agent}`);
+    if (addReloadError) warnCronReloadFailed(agent, addReloadError);
   });
 
 busCommand
@@ -2067,8 +2112,9 @@ busCommand
     }
 
     const env = resolveEnv();
-    await signalCronReload(agent, env.instanceId);
+    const removeReloadError = await signalCronReload(agent, env.instanceId);
     console.log(`Removed cron '${name}' from ${agent}`);
+    if (removeReloadError) warnCronReloadFailed(agent, removeReloadError);
   });
 
 busCommand
@@ -2200,8 +2246,9 @@ busCommand
     }
 
     const env = resolveEnv();
-    await signalCronReload(agent, env.instanceId);
+    const updateReloadError = await signalCronReload(agent, env.instanceId);
     console.log(`Updated cron '${name}' for ${agent}`);
+    if (updateReloadError) warnCronReloadFailed(agent, updateReloadError);
   });
 
 busCommand
