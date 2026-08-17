@@ -221,13 +221,19 @@ describe('AgentProcess opencode runtime', () => {
 
     const prompt = mockOpencodePty.spawn.mock.calls[0]?.[1] ?? '';
     expect(prompt).toContain('CONTEXT HANDOFF');
-    expect(prompt).toContain('VERY FIRST tool call MUST be a Bash call running');
-    expect(prompt).toContain("cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID 'back");
+    // The handoff note still reaches opencode, but it informs rather than
+    // mandates: whether to send is the agent's judgment under its own
+    // online-status step, which the daemon cannot evaluate from here.
+    expect(prompt).toContain('HANDOFF UX');
+    expect(prompt).toContain('your judgment');
+    expect(prompt).not.toContain('VERY FIRST tool call');
     // msg1: hook parity — codex/opencode don't run Claude Code hooks, so the
     // daemon emits the planned-restart lifecycle notif itself.
     expect(sendMessage).toHaveBeenCalledWith('12345', '🔄 opencode-agent restarted (planned): context handoff at 92%');
-    // msg2: opencode receives the same prompt-level first-action requirement as
-    // codex, so the daemon must not synthesize a weaker generic handoff ping.
+    // msg2: opencode receives the same handoff note as codex and decides for
+    // itself whether to send. The daemon must still not synthesize a generic
+    // substitute — it cannot evaluate those conditions either, so a substitute
+    // would reintroduce exactly the unconditional ping this note removed.
     expect(sendMessage).not.toHaveBeenCalledWith('12345', 'Agent opencode-agent is back online (context handoff)');
     expect(sendMessage).not.toHaveBeenCalledWith('12345', 'Agent opencode-agent is back online');
     expect(sendMessage).toHaveBeenCalledTimes(1);
