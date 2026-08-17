@@ -726,17 +726,30 @@ export class AgentProcess {
     const handoffBlock = this.consumeHandoffBlock();
     const isHandoffRestart = handoffBlock.length > 0;
     this.lastSpawnWasHandoff = isHandoffRestart;
-    // HANDOFF UX: the pickup message MUST be the first action after reading the handoff doc —
-    // before cron restoration, before heartbeat, before anything else. Placing this instruction
-    // immediately after the handoffBlock in the prompt ensures it is not buried.
+    // HANDOFF UX: tell a resuming session it is a continuation rather than a cold
+    // boot, and leave the messaging decision to the agent.
+    //
+    // This block used to mandate the send: "CRITICAL ... your VERY FIRST tool call
+    // MUST be ... send-telegram ... BEFORE running heartbeat, BEFORE any other tool
+    // call." That fired on every handoff restart with Telegram configured — at any
+    // hour, whether or not an earlier message from the agent was still unanswered,
+    // and whether or not the work was worth reporting — which is the unprompted
+    // narration and message-stacking the agent docs forbid. A prompt built here can
+    // see none of those conditions, so it must not order the send; the agent
+    // evaluates them under its own online-status step and defaults to silence.
+    //
+    // The ordering was backwards on its own terms too: update-heartbeat is what the
+    // dashboard reads to know the agent is alive and is free, internal and
+    // reversible, while the Telegram send is the expensive, externally-visible,
+    // irreversible one. So no first-call ordering is mandated here at all.
     const shouldPromptTelegram = this.shouldPromptTelegramOnlineMessage();
-    const handoffUxOverride = isHandoffRestart && shouldPromptTelegram
-      ? ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc. CRITICAL: After reading the handoff document, your VERY FIRST tool call MUST be a Bash call running: cortextos bus send-telegram $CTX_TELEGRAM_CHAT_ID \'back — [what you were just working on]\' — replace the brackets with one brief plain-English sentence about your current state. Do this BEFORE running heartbeat, BEFORE any other tool call. No cron IDs, no status report, no cold-boot phrasing. Do NOT send "Booting up... one moment" (skip AGENTS.md step 1 entirely).'
+    const handoffUxNote = isHandoffRestart && shouldPromptTelegram
+      ? ' HANDOFF UX: This is a context handoff restart — your memory is intact via the handoff doc, so this is a continuation, not a cold boot. Read the handoff document first and resume from its Next Actions. Do NOT send the cold-boot "Booting up... one moment" message (skip AGENTS.md step 1 entirely). Whether to send any Telegram message at all, and what it should say, is your judgment under AGENTS.md\'s online-status step — on a continuation the default is silence, so send only if that step\'s conditions actually hold.'
       : '';
     const onlineMessage = isHandoffRestart || !shouldPromptTelegram
       ? ''
       : ' Send a Telegram message to the user saying you are back online.';
-    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxOverride}${onlineMessage}${onboardingAppend}`;
+    return `You are starting a new session. Current UTC time: ${nowUtc}. Read AGENTS.md and all bootstrap files listed there. External crons are auto-loaded by the daemon — do NOT call CronCreate or CronList for cron restoration.${reminderBlock}${deliverablesBlock}${handoffBlock}${handoffUxNote}${onlineMessage}${onboardingAppend}`;
   }
 
   private buildContinuePrompt(): string {
@@ -859,12 +872,16 @@ export class AgentProcess {
       // msg1: planned-restart lifecycle notif, hook parity for runtimes without
       // Claude Code hooks. Both codex and opencode were missing this.
       send(this.buildPlannedRestartNotification());
-      // msg2 ("back — ...") is self-sent by the agent via the handoff boot prompt
-      // (agent-process.ts buildStartupPrompt handoffUxOverride) for BOTH codex and
-      // opencode — opencode now reliably honors it. The daemon used to send an
-      // "Agent X is back online (context handoff)" substitute for opencode, but
-      // that produced a redundant 3rd message on top of the self-sent "back —".
-      // Removed: msg1 (daemon) + msg2 (agent self-send) = clean 2-message pattern.
+      // msg2 ("back — ...") MAY be self-sent by the agent via the handoff boot
+      // prompt (agent-process.ts buildStartupPrompt handoffUxNote) for BOTH codex
+      // and opencode. That prompt no longer mandates the send — it is the agent's
+      // judgment under its online-status step, which defaults to silence on a
+      // continuation. So a handoff restart is a 1-OR-2 message pattern: this
+      // lifecycle notif always, plus the agent's own "back — ..." only when its
+      // conditions actually hold. The daemon used to send an "Agent X is back
+      // online (context handoff)" substitute for opencode; that stays removed,
+      // because the daemon cannot evaluate those conditions either and the
+      // substitute produced a redundant 3rd message.
       return;
     }
 
