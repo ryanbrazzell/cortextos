@@ -8,6 +8,7 @@ import {
   recordInboundTelegram,
   cacheLastSent,
   readLastSent,
+  getLastOutboundTimestamp,
 } from '../../../src/telegram/logging';
 import { TelegramAPI } from '../../../src/telegram/api';
 import type { BusPaths, TelegramMessage } from '../../../src/types';
@@ -319,4 +320,107 @@ describe('TelegramAPI.sendPhoto', () => {
     expect(body.get('caption')).toBeNull();
     expect(body.get('reply_markup')).toBeNull();
   });
+});
+
+describe('getLastOutboundTimestamp', () => {
+  let testDir: string;
+  const CHAT = '8501517499';
+
+  const writeLog = (agent: string, lines: string[]) => {
+    const dir = join(testDir, 'logs', agent);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'outbound-messages.jsonl'), lines.join('\n') + '\n', 'utf-8');
+  };
+  const entry = (ts: string, chatId: string, text = 'hi') =>
+    JSON.stringify({ timestamp: ts, agent: 'bot1', chat_id: chatId, text, message_id: 1 });
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-lastout-'));
+  });
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('returns null when the log does not exist', () => {
+    expect(getLastOutboundTimestamp(testDir, 'bot1', CHAT)).toBeNull();
+  });
+
+  it('returns null for an empty log', () => {
+    writeLog('bot1', []);
+    expect(getLastOutboundTimestamp(testDir, 'bot1', CHAT)).toBeNull();
+  });
+
+  it('returns the timestamp of the only matching entry', () => {
+    writeLog('bot1', [entry('2026-08-07T08:09:34Z', CHAT)]);
+    expect(getLastOutboundTimestamp(testDir, 'bot1', CHAT))
+      .toBe(Date.parse('2026-08-07T08:09:34Z'));
+  });
+
+  it('returns the LAST matching entry, not the first', () => {
+    writeLog('bot1', [
+      entry('2026-08-07T07:00:00Z', CHAT, 'older'),
+      entry('2026-08-07T08:09:34Z', CHAT, 'newer'),
+    ]);
+    const got = getLastOutboundTimestamp(testDir, 'bot1', CHAT);
+    expect(got).toBe(Date.parse('2026-08-07T08:09:34Z'));
+    // Negative arm: a first-match implementation would return the older one.
+    expect(got).not.toBe(Date.parse('2026-08-07T07:00:00Z'));
+  });
+
+  it('ignores entries addressed to a different chat', () => {
+    writeLog('bot1', [
+      entry('2026-08-07T07:00:00Z', CHAT, 'ours'),
+      entry('2026-08-07T08:59:00Z', '999999', 'someone else'),
+    ]);
+    const got = getLastOutboundTimestamp(testDir, 'bot1', CHAT);
+    expect(got).toBe(Date.parse('2026-08-07T07:00:00Z'));
+    // Negative arm: an unfiltered implementation returns the other chat's newer send.
+    expect(got).not.toBe(Date.parse('2026-08-07T08:59:00Z'));
+  });
+
+  it('returns null when the log holds only other chats', () => {
+    writeLog('bot1', [entry('2026-08-07T08:59:00Z', '999999')]);
+    expect(getLastOutboundTimestamp(testDir, 'bot1', CHAT)).toBeNull();
+  });
+
+  it('matches a numeric chat_id argument against the logged string', () => {
+    writeLog('bot1', [entry('2026-08-07T08:09:34Z', CHAT)]);
+    expect(getLastOutboundTimestamp(testDir, 'bot1', Number(CHAT)))
+      .toBe(Date.parse('2026-08-07T08:09:34Z'));
+  });
+
+  it('skips malformed JSON and unparseable timestamps to reach a good entry', () => {
+    writeLog('bot1', [
+      entry('2026-08-07T07:00:00Z', CHAT, 'good'),
+      JSON.stringify({ timestamp: 'not-a-date', chat_id: CHAT, text: 'bad ts' }),
+      '{ this is not json',
+    ]);
+    expect(getLastOutboundTimestamp(testDir, 'bot1', CHAT))
+      .toBe(Date.parse('2026-08-07T07:00:00Z'));
+  });
+
+  it('finds a recent entry at the end of a log far larger than the scan window', () => {
+    const filler = Array.from({ length: 400 },
+      (_, i) => entry('2026-08-01T00:00:00Z', CHAT, 'x'.repeat(500) + i));
+    writeLog('bot1', [...filler, entry('2026-08-07T08:09:34Z', CHAT, 'newest')]);
+    expect(getLastOutboundTimestamp(testDir, 'bot1', CHAT))
+      .toBe(Date.parse('2026-08-07T08:09:34Z'));
+  });
+
+  it('fails OPEN (null) when this chat appears only beyond the scan window', () => {
+    // The one entry for CHAT is buried behind >64KB of another chat's traffic,
+    // so it falls outside the bounded tail read. Reporting "don't know" here is
+    // the deliberate safe direction: the caller must then let the message send.
+    const filler = Array.from({ length: 400 },
+      (_, i) => entry('2026-08-07T08:00:00Z', '999999', 'y'.repeat(500) + i));
+    writeLog('bot1', [entry('2026-08-07T07:00:00Z', CHAT, 'buried'), ...filler]);
+    expect(getLastOutboundTimestamp(testDir, 'bot1', CHAT)).toBeNull();
+  });
+
+  // NOTE: there is deliberately no test for the partial-first-line drop in
+  // getLastOutboundTimestamp. One was written and mutation-testing showed it
+  // vacuous — it passed with the branch disabled, because a truncated fragment
+  // fails JSON.parse and is skipped by the malformed-line catch regardless.
+  // The branch is unobservable defence-in-depth, so it is documented at the
+  // source rather than guarded by a test that cannot fail.
 });

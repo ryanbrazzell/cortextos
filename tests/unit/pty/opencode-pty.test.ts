@@ -191,6 +191,9 @@ describe('OpencodePTY', () => {
   });
 
   it('keeps OPENCODE_CONFIG_DIR under the agent directory even when working_directory differs', async () => {
+    // AgentPTY now validates a non-empty working_directory via super.spawn's
+    // existsSync check, so the configured path must resolve as present.
+    fsMocks.existsSync.mockImplementation((p: string) => p === '/tmp/project-checkout');
     const pty = new OpencodePTY(mockEnv, { working_directory: '/tmp/project-checkout' });
     installSpawnMock(pty);
     await pty.spawn('fresh', 'boot');

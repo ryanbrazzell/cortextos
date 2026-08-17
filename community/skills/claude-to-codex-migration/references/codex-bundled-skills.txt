@@ -1,0 +1,28 @@
+# The codex "stdlib" — 23 skills bundled by `templates/agent-codex/`
+# Source: templates/agent-codex/plugins/cortextos-agent-skills/skills/ (verified count 23).
+# Any source-agent skill whose name is in this list ships for free via
+# `cortextos add-agent --template agent-codex` — do NOT re-copy it. Only skills
+# NOT in this list are "custom" and must be ported + leakage-grepped + symlinked.
+activity-channel
+agent-browser
+agent-management
+approvals
+auto-skill
+autoresearch
+bus-reference
+comms
+cron-management
+env-management
+event-logging
+guardrails-reference
+heartbeat
+human-tasks
+knowledge-base
+m2c1-worker
+memory
+onboarding
+soul-philosophy
+system-diagnostics
+tasks
+tool-registration
+worker-agents

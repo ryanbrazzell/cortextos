@@ -287,6 +287,73 @@ describe('AgentManager.restartAgent - BUG-007 fix (rebuild Telegram poller)', ()
   });
 });
 
+describe('AgentManager.stopAgent - disable-resurrection fix (stop wins vs queued restart)', () => {
+  let testDir: string;
+  let ctxRoot: string;
+  let frameworkRoot: string;
+
+  beforeEach(() => {
+    testDir = mkdtempSync(join(tmpdir(), 'cortextos-am-stop-test-'));
+    ctxRoot = join(testDir, 'instance');
+    frameworkRoot = join(testDir, 'framework');
+    mkdirSync(join(ctxRoot, 'config'), { recursive: true });
+    mkdirSync(join(frameworkRoot, 'orgs', 'acme', 'agents', 'alice'), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it('user-initiated stop drops a queued pendingRestart (stop wins)', async () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    (am as any).agents.set('alice', {
+      process: { stop: vi.fn().mockResolvedValue(undefined) },
+      checker: { stop: vi.fn() },
+    });
+    (am as any).pendingRestarts.add('alice');
+    const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+
+    await am.stopAgent('alice', true);
+
+    expect(startSpy).not.toHaveBeenCalled();
+    expect((am as any).pendingRestarts.has('alice')).toBe(false);
+  });
+
+  it('internal (restart-all) stop still honors a queued pendingRestart (BUG-011 preserved)', async () => {
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    (am as any).agents.set('alice', {
+      process: { stop: vi.fn().mockResolvedValue(undefined) },
+      checker: { stop: vi.fn() },
+    });
+    (am as any).pendingRestarts.add('alice');
+    const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+
+    await am.stopAgent('alice');
+
+    expect(startSpy).toHaveBeenCalledWith('alice', '');
+  });
+
+  it('restart stop-half (userInitiated=false) honors the queued pendingRestart (regression #859)', async () => {
+    // Reproduces the restart flow at the manager level: restart's fire-and-forget
+    // stop races with its own start-agent, which queues a pendingRestart. With
+    // userInitiated=false the honor path must fire startAgent — restoring the
+    // pre-PR behavior the CI-invisible regression broke. (The manager's own
+    // default is false; "stop wins" lives at the IPC handler's `?? true`.)
+    const am = new AgentManager('test-instance', ctxRoot, frameworkRoot, 'acme');
+    (am as any).agents.set('alice', {
+      process: { stop: vi.fn().mockResolvedValue(undefined) },
+      checker: { stop: vi.fn() },
+    });
+    (am as any).pendingRestarts.add('alice');
+    const startSpy = vi.spyOn(am, 'startAgent').mockResolvedValue();
+
+    await am.stopAgent('alice', false);
+
+    expect(startSpy).toHaveBeenCalledWith('alice', '');
+    expect((am as any).pendingRestarts.has('alice')).toBe(false);
+  });
+});
+
 describe('buildReplyContext - Telegram reply context (BUG fix: media replies lost)', () => {
   it('returns undefined when no reply message', () => {
     expect(buildReplyContext(undefined)).toBeUndefined();
