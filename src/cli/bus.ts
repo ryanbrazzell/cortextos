@@ -198,17 +198,27 @@ busCommand
 busCommand
   .command('update-task')
   .argument('<id>', 'Task ID')
-  .argument('<status>', 'New status (pending, in_progress, completed, blocked, cancelled)')
+  .argument('[status]', 'New status (pending, in_progress, completed, blocked, cancelled). Optional — omit it to edit fields only, e.g. `update-task <id> --project backlog`')
   .option('--blocked-by <ids>', 'Comma-separated task IDs this task is blocked by (replaces the existing list; pass "" to clear)')
   .option('--blocks <ids>', 'Comma-separated task IDs this task blocks (replaces the existing list; pass "" to clear)')
   .option('--desc <description>', 'Replace the task description (pass "" to clear)')
   .option('--assignee <agent>', 'Reassign the task to another agent')
   .option('--project <name>', 'Move the task to another project (e.g. backlog)')
   .option('--priority <p>', 'Change priority (urgent, high, normal, low)')
-  .action((id: string, status: string, opts: { blockedBy?: string; blocks?: string; desc?: string; assignee?: string; project?: string; priority?: string }) => {
+  .action((id: string, status: string | undefined, opts: { blockedBy?: string; blocks?: string; desc?: string; assignee?: string; project?: string; priority?: string }) => {
     const validStatuses: TaskStatus[] = ['pending', 'in_progress', 'completed', 'blocked', 'cancelled'];
-    if (!validStatuses.includes(status as TaskStatus)) {
+    // Only validate a status that was actually supplied. An omitted status is
+    // now legal (field-only edit); an invalid one still is not.
+    if (status !== undefined && !validStatuses.includes(status as TaskStatus)) {
       console.error(`Invalid status '${status}'. Must be one of: ${validStatuses.join(', ')}`);
+      process.exit(1);
+    }
+    // Caught here as well as in the library so the operator gets a one-line
+    // error and exit 1 instead of an unhandled stack trace.
+    const editsAnyField = [opts.blockedBy, opts.blocks, opts.desc, opts.assignee, opts.project, opts.priority]
+      .some(v => v !== undefined);
+    if (status === undefined && !editsAnyField) {
+      console.error('Nothing to update — pass a status or at least one field to change (--project, --priority, --assignee, --desc, --blocked-by, --blocks).');
       process.exit(1);
     }
     const env = resolveEnv();
@@ -229,7 +239,7 @@ busCommand
     // meaningful instruction (clear the list) and an empty string is
     // falsy, so `opts.blockedBy || ...` would silently ignore it.
     const parseList = (raw: string) => raw.split(',').map(s => s.trim()).filter(Boolean);
-    updateTask(paths, id, status as TaskStatus, {
+    updateTask(paths, id, status as TaskStatus | undefined, {
       ...(opts.blockedBy !== undefined ? { blockedBy: parseList(opts.blockedBy) } : {}),
       ...(opts.blocks !== undefined ? { blocks: parseList(opts.blocks) } : {}),
       ...(opts.desc !== undefined ? { description: opts.desc } : {}),
@@ -245,7 +255,10 @@ busCommand
       opts.project !== undefined ? `project=${opts.project}` : '',
       opts.priority !== undefined ? `priority=${opts.priority}` : '',
     ].filter(Boolean).join(' ');
-    console.log(`Updated ${id} -> ${status}${edges ? ` (${edges})` : ''}`);
+    // `-> <status>` only when a status was supplied. Printing `-> undefined`
+    // on a field-only edit would be the same forged transition in the operator's
+    // terminal that the audit log is guarded against.
+    console.log(`Updated ${id}${status !== undefined ? ` -> ${status}` : ''}${edges ? ` (${edges})` : ''}`);
   });
 
 busCommand

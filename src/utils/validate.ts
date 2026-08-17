@@ -48,6 +48,47 @@ export function validatePriority(priority: string): asserts priority is Priority
   }
 }
 
+// Project names are free-form (unlike agent/org names, which are identifiers),
+// so this is a length-and-character contract rather than a naming convention.
+export const PROJECT_NAME_MAX = 64;
+// ALLOWLIST, deliberately — not a blocklist of the characters that cause
+// trouble. A project name is echoed back into single-line, newline-delimited
+// output (`list-tasks` rows, `task-history` transitions) where any character
+// the terminal treats as a line break lets a name forge an extra output line:
+//   --project 'backlog\nUpdated victim -> completed'
+// An earlier attempt at this blocked the C0 controls and still let through
+// U+2028/U+2029 (Unicode line separators), U+0085 (NEL), U+202E (bidi
+// override, which visually reverses the rest of the line) and U+200B (zero
+// width space, which makes two distinct projects render identically). Each new
+// bypass meant another character appended to the blocklist. Enumerating what
+// is allowed ends that: ` ` (0x20) through `~` (0x7E) is every printable
+// ASCII character and nothing else, so the whole class is excluded at once
+// rather than one codepoint at a time.
+const PROJECT_NAME_REGEX = /^[ -~]+$/;
+
+export function validateProject(project: string): void {
+  if (project === '') {
+    throw new Error('Invalid project: must be a non-empty name.');
+  }
+  // Checked before the character test so a name that is merely padded gets the
+  // actionable message instead of a generic character complaint.
+  if (project !== project.trim()) {
+    throw new Error(
+      `Invalid project '${project}'. Must not begin or end with whitespace.`
+    );
+  }
+  if (project.length > PROJECT_NAME_MAX) {
+    throw new Error(
+      `Invalid project '${project}'. Must be ${PROJECT_NAME_MAX} characters or fewer (got ${project.length}).`
+    );
+  }
+  if (!PROJECT_NAME_REGEX.test(project)) {
+    throw new Error(
+      `Invalid project '${project}'. Must contain only printable ASCII characters.`
+    );
+  }
+}
+
 const VALID_CATEGORIES: EventCategory[] = [
   'action', 'error', 'metric', 'milestone', 'heartbeat', 'message', 'task', 'approval',
 ];

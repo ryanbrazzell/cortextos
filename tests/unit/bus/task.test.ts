@@ -92,7 +92,10 @@ describe('Task Management', () => {
       expect(content.created_by).toBe('paul');
       expect(content.org).toBe('acme');
       expect(content.priority).toBe('high');
-      expect(content.project).toBe('');
+      // 'backlog', not '': an omitted project now defaults to the backlog
+      // rather than leaving the task untagged and invisible to every
+      // project-scoped query.
+      expect(content.project).toBe('backlog');
       expect(content.kpi_key).toBeNull();
       expect(content.created_at).toBeTruthy();
       expect(content.updated_at).toBeTruthy();
