@@ -22,6 +22,7 @@ function makePaths(dir: string): BusPaths {
     taskDir: join(dir, 'tasks'),
     approvalDir: join(dir, 'approvals'),
     analyticsDir: join(dir, 'analytics'),
+    deliverablesDir: join(dir, 'deliverables'),
   };
 }
 

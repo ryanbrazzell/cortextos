@@ -30,6 +30,7 @@ function makePaths(agent: string): BusPaths {
     taskDir: join(ctxRoot, 'orgs', 'codex-org', 'tasks'),
     approvalDir: join(ctxRoot, 'orgs', 'codex-org', 'approvals'),
     analyticsDir: join(ctxRoot, 'orgs', 'codex-org', 'analytics'),
+    deliverablesDir: join(ctxRoot, 'orgs', 'codex-org', 'deliverables'),
   };
 }
 

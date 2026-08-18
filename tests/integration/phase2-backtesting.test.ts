@@ -922,11 +922,9 @@ describe('Scenario 5: Daemon kill + restart — full state recovery', () => {
       const allLogEntries   = readExecLog(f.name);
       const firedEntries    = allLogEntries.filter(e => e.status === 'fired');
       const preKillFired    = preKillLogCounts.get(f.name) ?? 0;
-      const postRestartFired = fireCounts2.get
-        ? [...fireCounts2.entries()]
-            .filter(([k]) => k.startsWith(`${f.name}/`))
-            .reduce((sum, [, v]) => sum + v, 0)
-        : 0;
+      const postRestartFired = [...fireCounts2.entries()]
+        .filter(([k]) => k.startsWith(`${f.name}/`))
+        .reduce((sum, [, v]) => sum + v, 0);
 
       // Total logged entries must be at least pre-kill + post-restart
       // (some catch-up fires may not appear if fires_counts2 count only onFire callbacks,
