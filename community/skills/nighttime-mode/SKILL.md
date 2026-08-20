@@ -134,9 +134,9 @@ Before the morning review cron fires, ensure this data is ready in today's memor
 
 ```bash
 TODAY=$(date -u +%Y-%m-%d)
-cat >> "memory/$TODAY.md" << MEMEOF
-
-## Overnight Summary - $(date -u +%H:%M:%S)
+# Header printf'd so the body heredoc can stay QUOTED (backticks in the body must NOT execute).
+printf '\n## Overnight Summary - %s\n' "$(date -u +%H:%M:%S)" >> "memory/$TODAY.md"
+cat >> "memory/$TODAY.md" << 'MEMEOF'
 
 ### Completed
 - [task] by [agent] -- [deliverable at path/]

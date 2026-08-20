@@ -95,9 +95,9 @@ TODAY=$(date -u +%Y-%m-%d)
 LOCAL_TIME=$(date +'%-I:%M %p %Z' 2>/dev/null || date)
 MEMORY_DIR="$(pwd)/memory"
 mkdir -p "$MEMORY_DIR"
-cat >> "$MEMORY_DIR/$TODAY.md" << MEMORY
-
-## Heartbeat Update - $(date -u +'%H:%M UTC') / $LOCAL_TIME
+# Header printf'd so the body heredoc can stay QUOTED (backticks in the body must NOT execute).
+printf '\n## Heartbeat Update - %s / %s\n' "$(date -u +'%H:%M UTC')" "$LOCAL_TIME" >> "$MEMORY_DIR/$TODAY.md"
+cat >> "$MEMORY_DIR/$TODAY.md" << 'MEMORY'
 - WORKING ON: <task_id or "none">
 - Status: <healthy/working/blocked>
 - Inbox: <N messages processed>

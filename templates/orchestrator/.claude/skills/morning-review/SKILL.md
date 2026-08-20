@@ -297,9 +297,9 @@ cortextos bus update-heartbeat "morning review complete - dispatched N tasks"
 
 # Write to memory
 TODAY=$(date -u +%Y-%m-%d)
-cat >> "memory/$TODAY.md" << MEMEOF
-
-## Morning Review - $(date -u +%H:%M:%S)
+# Header printf'd so the body heredoc can stay QUOTED (backticks in the body must NOT execute).
+printf '\n## Morning Review - %s\n' "$(date -u +%H:%M:%S)" >> "memory/$TODAY.md"
+cat >> "memory/$TODAY.md" << 'MEMEOF'
 - Daily focus: <what user said>
 - Goals cascaded to: <list agents>
 - Tasks dispatched: N
