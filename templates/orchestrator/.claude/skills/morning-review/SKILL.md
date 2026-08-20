@@ -168,14 +168,14 @@ For each agent in the roster:
 2. Write their `goals.json`:
    ```bash
    cat > $CTX_FRAMEWORK_ROOT/orgs/$CTX_ORG/agents/<agent>/goals.json << 'EOF'
-   {
-     "focus": "role-specific focus derived from today's daily_focus",
-     "goals": ["goal 1", "goal 2", "goal 3"],
-     "bottleneck": "",
-     "updated_at": "ISO_TIMESTAMP",
-     "updated_by": "$CTX_AGENT_NAME"
-   }
-   EOF
+{
+  "focus": "role-specific focus derived from today's daily_focus",
+  "goals": ["goal 1", "goal 2", "goal 3"],
+  "bottleneck": "",
+  "updated_at": "ISO_TIMESTAMP",
+  "updated_by": "$CTX_AGENT_NAME"
+}
+EOF
    ```
 3. Regenerate GOALS.md:
    ```bash
