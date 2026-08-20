@@ -7,9 +7,12 @@
  *     classifies the exit as "rate-limited" so it is suppressed rather than
  *     spamming a 🚨 CRASH alert every 30 minutes while the daemon respawn
  *     loop continues hitting the wall.
- *   - Applies quiet hours (22:00-07:00 America/Los_Angeles) for routine end
- *     types (planned-restart, session-refresh, daemon-stop, user-*,
- *     rate-limited). A real unexpected crash still pages at night.
+ *   - Suppresses system-scheduled end types (planned-restart, session-refresh)
+ *     around the clock — they report an event nobody requested and nothing the
+ *     owner can act on.
+ *   - Applies quiet hours (22:00-07:00 America/Los_Angeles) to the merely-routine
+ *     types (daemon-stop, user-*, rate-limited), which stay audible during the
+ *     day. A real unexpected crash still pages at night.
  *   - Deduplicates identical alerts for the same agent within 10 minutes so a
  *     broken watchdog loop results in at most one notification, not a buzz
  *     storm.
@@ -23,18 +26,95 @@ const DEDUP_WINDOW_MS = 10 * 60 * 1000;         // 10 minutes
 const QUIET_HOUR_START_LA = 22;                 // 22:00 America/Los_Angeles
 const QUIET_HOUR_END_LA = 7;                    // 07:00 America/Los_Angeles
 
-// End types that are routine and should be suppressed during quiet hours.
-// "crash" is deliberately NOT in this list — a genuine unexpected crash at
-// 3am is worth waking up for.
-const QUIET_SUPPRESSED_TYPES = new Set([
+// End types the system schedules for itself. These carry no information the owner
+// can act on — nobody asked for them and nothing is wrong — so they are suppressed
+// around the clock, not just overnight. 332 restarts over 11 days on this host were
+// ALL of this kind and ZERO were crashes; gating them on quiet hours meant the
+// suppression did nothing during the day, which is when most restarts happen.
+//
+// Kept deliberately SMALL. The obvious change here is to promote all of
+// QUIET_SUPPRESSED_TYPES, and that would be wrong: `rate-limited` means the agent
+// is PAUSED and is exactly what an owner needs to see at 2pm, and the `user-*`
+// types are confirmations of a command the owner just issued. Suppressing those
+// around the clock would hide real state under cover of a noise fix.
+/**
+ * The classifier's fallback end type: the hook fired, but no fresh marker was
+ * found. It was previously called `crash`, which was a category error.
+ *
+ * A SessionEnd hook CANNOT witness a hard crash. Verified on this host
+ * (Claude Code 2.1.218) in both process shapes — headless `-p` and interactive
+ * in a PTY — that an externally-signalled death (SIGKILL, SIGTERM) does not
+ * fire SessionEnd at all, and the docs state outright that SIGKILL prevents it:
+ * a dead process cannot spawn a hook. The stdin payload's `reason` field has no
+ * crash value either (clear | resume | logout | prompt_input_exit |
+ * bypass_permissions_disabled | other), so no positive crash evidence is
+ * obtainable here at all.
+ *
+ * So reaching this branch means the session ended gracefully enough to run
+ * hooks AND no fresh marker was present — a marker write race, a marker aged
+ * past MARKER_TTL_MS, or an internal fatal that still unwound cleanly. A
+ * killed, OOM'd or segfaulted agent produces no record here whatsoever.
+ *
+ * Real crash detection lives daemon-side, where a supervisor observes its
+ * child's exit however the child died: agent-process.ts `pty.onExit` ->
+ * handleExit() -> lastExitWasCrash -> CRASH / CRASH_LOOP / HALTED.
+ *
+ * Kept as a signal rather than dropped: a marker race is still weak evidence
+ * worth a trace. Demoted, not silenced — see the alert policy below.
+ */
+export const ENDED_WITHOUT_MARKER = 'ended-without-marker';
+
+const ALWAYS_SUPPRESSED_TYPES = new Set([
   'planned-restart',
   'session-refresh',
+]);
+
+// End types that are routine ENOUGH to hold overnight but still worth saying during
+// the day.
+//
+// ENDED_WITHOUT_MARKER *is* in this list. It used to be excluded under the
+// rationale "a genuine unexpected crash at 3am is worth waking up for" — but
+// that rationale is void: this type cannot represent a crash (see above), and
+// all 3 occurrences on this host across 11 days were false positives. The type
+// that genuinely warrants waking someone is `daemon-crashed`, which is written
+// from the daemon's uncaughtException handler — positive evidence, and
+// deliberately still absent from this set.
+const QUIET_SUPPRESSED_TYPES = new Set([
+  ...ALWAYS_SUPPRESSED_TYPES,
   'daemon-stop',
   'user-restart',
   'user-disable',
   'user-stop',
   'rate-limited',
+  ENDED_WITHOUT_MARKER,
 ]);
+
+/**
+ * Bus priority for the chief+analyst notify, by end type.
+ *
+ * Extracted from main() for the same reason as shouldSuppressAlert: main() is
+ * not unit-testable, so a policy left inline there can only be asserted by a
+ * test that hardcodes the same answer. This is the demotion decision itself.
+ *
+ * Defaults to 'high' for anything unrecognised — an unknown end type reaching
+ * the notify path should be loud, matching the fail-toward-telling polarity
+ * used everywhere else in this file.
+ */
+export function notifyPriorityFor(endType: string): string {
+  return endType === ENDED_WITHOUT_MARKER ? 'low' : 'high';
+}
+
+/**
+ * Whether the Telegram alert for this end type should be withheld.
+ *
+ * Extracted from main() so the policy is testable without spawning the hook. The
+ * crashes.log append happens BEFORE this is consulted and is unconditional, so
+ * suppression here costs visibility in the channel, never the audit trail.
+ */
+export function shouldSuppressAlert(endType: string, now: Date): boolean {
+  if (ALWAYS_SUPPRESSED_TYPES.has(endType)) return true;
+  return isQuietHoursLA(now) && QUIET_SUPPRESSED_TYPES.has(endType);
+}
 
 function isQuietHoursLA(now: Date): boolean {
   const laString = now.toLocaleString('en-US', {
@@ -94,9 +174,15 @@ export function readMaxCrashesPerDay(agentDir: string | undefined): number | nul
 }
 
 /**
- * Send a crash notification via `cortextos bus send-message` to the listed
- * recipient agents. Best-effort: failures are swallowed so an alert miss never
- * cascades into a hook crash.
+ * Send a session-end notification via `cortextos bus send-message` to the
+ * listed recipient agents. Best-effort: failures are swallowed so an alert miss
+ * never cascades into a hook crash.
+ *
+ * `priority` is supplied by the caller rather than derived here, because the
+ * two end types that reach this function have very different standing:
+ * `daemon-crashed` is positive evidence and pages at `high`; ENDED_WITHOUT_MARKER
+ * is an absence and is a `low` trace. Deriving it internally would couple this
+ * helper to the alert policy and make the demotion untestable in isolation.
  */
 export function notifyAgents(opts: {
   agentName: string;
@@ -106,14 +192,21 @@ export function notifyAgents(opts: {
   crashCount: number;
   restartAttempted: boolean;
   recipients: string[];
+  priority?: string;
 }): void {
+  // Wording matters: this used to assert "crashed" for both arms, which is what
+  // made the absence-fallback read as a confirmed death to chief/analyst.
+  const headline = opts.endType === ENDED_WITHOUT_MARKER
+    ? `agent=${opts.agentName} session ended with no restart marker (type=${opts.endType}) — NOT a confirmed crash; a hook cannot observe one. Check the daemon's restarts.log for a real exit.`
+    : `agent=${opts.agentName} crashed (type=${opts.endType})`;
   const body = [
-    `agent=${opts.agentName} crashed (type=${opts.endType})`,
+    headline,
     `reason: ${opts.reason || 'none'}`,
     `last status: ${opts.lastTask || 'unknown'}`,
     `crashes today: ${opts.crashCount}`,
     `restart attempted: ${opts.restartAttempted ? 'yes' : 'no (max_crashes_per_day reached)'}`,
   ].join('\n');
+  const priority = opts.priority ?? 'high';
   // PATH-unaware execFile is unreliable on Windows: the daemon spawned by
   // PM2 doesn't inherit the npm-link target, so 'cortextos' fails ENOENT and
   // crash alerts are silently dropped — operator loses visibility into the
@@ -126,7 +219,7 @@ export function notifyAgents(opts: {
       if (cliPath) {
         execFile(
           process.execPath,
-          [cliPath, 'bus', 'send-message', target, 'high', body],
+          [cliPath, 'bus', 'send-message', target, priority, body],
           { timeout: 10_000 },
           () => { /* fire-and-forget */ },
         );
@@ -134,7 +227,7 @@ export function notifyAgents(opts: {
         // Fallback: CTX_FRAMEWORK_ROOT unset (rare — test env). Try PATH lookup.
         execFile(
           'cortextos',
-          ['bus', 'send-message', target, 'high', body],
+          ['bus', 'send-message', target, priority, body],
           { timeout: 10_000 },
           () => { /* fire-and-forget */ },
         );
@@ -231,7 +324,8 @@ async function readHookInput(): Promise<{ session_id?: string }> {
  * A marker older than MARKER_TTL_MS is treated as stale: ignored (so it
  * cannot misclassify a later genuine crash) and lazy-unlinked here.
  *
- * Returns { endType: 'crash' } when no fresh marker is present.
+ * Returns { endType: ENDED_WITHOUT_MARKER } when no fresh marker is present.
+ * That is an ABSENCE, not a detection — see the constant's docblock.
  */
 export function classifyFromMarkers(
   stateDir: string,
@@ -257,7 +351,7 @@ export function classifyFromMarkers(
     } catch { /* ignore */ }
     return { endType: marker.type, reason };
   }
-  return { endType: 'crash', reason: '' };
+  return { endType: ENDED_WITHOUT_MARKER, reason: '' };
 }
 
 async function main(): Promise<void> {
@@ -302,7 +396,7 @@ async function main(): Promise<void> {
   // If no marker matched but the stdout tail shows a rate-limit signature,
   // reclassify as rate-limited. Prevents the 30-minute 🚨 CRASH buzz storm
   // when the weekly limit is exhausted.
-  if (endType === 'crash') {
+  if (endType === ENDED_WITHOUT_MARKER) {
     const stdoutPath = join(logDir, 'stdout.log');
     if (existsSync(stdoutPath) && detectRateLimitInLog(stdoutPath)) {
       endType = 'rate-limited';
@@ -310,11 +404,14 @@ async function main(): Promise<void> {
     }
   }
 
-  // Track crash count (real crashes only).
+  // Counter behaviour is deliberately UNCHANGED by the rename — only the label
+  // moved. `.crash_count_today` still feeds `restartAttempted` against
+  // max_crashes_per_day, and re-basing that policy is a separate decision from
+  // relabelling the signal.
   const today = new Date().toISOString().split('T')[0];
   const countFile = join(stateDir, '.crash_count_today');
   let crashCount = 0;
-  if (endType === 'crash') {
+  if (endType === ENDED_WITHOUT_MARKER) {
     try {
       const data = readFileSync(countFile, 'utf-8').trim();
       const [date, count] = data.split(':');
@@ -356,21 +453,26 @@ async function main(): Promise<void> {
 
   // Decide whether to actually send to Telegram.
   const now = new Date();
-  const quiet = isQuietHoursLA(now);
-  if (quiet && QUIET_SUPPRESSED_TYPES.has(endType)) {
+  if (shouldSuppressAlert(endType, now)) {
     return;
   }
   if (shouldSuppressDedup(stateDir, endType)) {
     return;
   }
 
-  // Real-crash agent alerts: notify chief + analyst on crash and daemon-crashed
-  // so silent failures get visibility on the bus, not just on Telegram. Gated
-  // by the same dedup window as the Telegram send (handled above), and skipped
-  // for clean exits / planned restarts / rate-limit pauses. Hoisted above the
-  // Telegram-credential gate so agents without BOT_TOKEN/CHAT_ID still reach
-  // the bus (issue #317).
-  if (endType === 'crash' || endType === 'daemon-crashed') {
+  // Agent-side end-of-session alerts: notify chief + analyst so silent failures
+  // get visibility on the bus, not just on Telegram. Gated by the same dedup
+  // window as the Telegram send (handled above), and skipped for clean exits /
+  // planned restarts / rate-limit pauses. Hoisted above the Telegram-credential
+  // gate so agents without BOT_TOKEN/CHAT_ID still reach the bus (issue #317).
+  //
+  // The two arms are NOT peers and no longer page alike:
+  //  - `daemon-crashed` is POSITIVE evidence (a .daemon-crashed marker written
+  //    by the daemon's uncaughtException handler) and keeps `high`.
+  //  - ENDED_WITHOUT_MARKER is an ABSENCE and drops to `low`. Demoted rather
+  //    than removed: it cannot mean "crashed", but a marker race is still worth
+  //    a trace. Keeping it at `high` paged chief+analyst on 3/3 false positives.
+  if (endType === ENDED_WITHOUT_MARKER || endType === 'daemon-crashed') {
     const agentDir = process.env.CTX_AGENT_DIR || process.cwd();
     const maxCrashes = readMaxCrashesPerDay(agentDir);
     const restartAttempted = maxCrashes === null || crashCount < maxCrashes;
@@ -382,6 +484,7 @@ async function main(): Promise<void> {
       crashCount,
       restartAttempted,
       recipients: ['chief', 'analyst'],
+      priority: notifyPriorityFor(endType),
     });
   }
 
@@ -427,9 +530,13 @@ async function main(): Promise<void> {
     case 'rate-limited':
       message = `⏳ ${agentName} paused — Anthropic rate limit hit. Will resume when the window resets.`;
       break;
-    case 'crash':
-      message = `🚨 CRASH: ${agentName} died unexpectedly.`;
-      if (crashCount > 0) message += ` Crashes today: ${crashCount}.`;
+    case ENDED_WITHOUT_MARKER:
+      // Was "🚨 CRASH: <agent> died unexpectedly." That asserted a death this
+      // hook is structurally incapable of observing, and every occurrence on
+      // this host was a false positive. Reworded to state the observation
+      // (no marker) rather than a conclusion (died), and de-escalated from 🚨.
+      message = `⚠️ ${agentName} — session ended with no restart marker. Not a confirmed crash; restarting.`;
+      if (crashCount > 0) message += ` Unmarked ends today: ${crashCount}.`;
       if (lastTask) message += `\nLast status: ${lastTask}`;
       break;
   }
