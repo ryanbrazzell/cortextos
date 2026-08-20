@@ -53,9 +53,9 @@ cortextos bus log-event heartbeat agent_heartbeat info --meta '{"agent":"'$CTX_A
 ```bash
 TODAY=$(date -u +%Y-%m-%d)
 mkdir -p memory
-cat >> "memory/$TODAY.md" << MEMORY
-
-## Heartbeat Update - $(date -u +%H:%M)
+# Header printf'd so the body heredoc can stay QUOTED (backticks in the body must NOT execute).
+printf '\n## Heartbeat Update - %s\n' "$(date -u +%H:%M)" >> "memory/$TODAY.md"
+cat >> "memory/$TODAY.md" << 'MEMORY'
 - WORKING ON: <task_id or "none">
 - Status: <healthy/working/blocked>
 - Inbox: <N messages processed>

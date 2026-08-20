@@ -163,9 +163,9 @@ cortextos bus update-heartbeat "weekly review complete - next week planned"
 
 # Write to memory
 TODAY=$(date -u +%Y-%m-%d)
-cat >> "memory/$TODAY.md" << MEMEOF
-
-## Weekly Review - $(date -u +%H:%M:%S)
+# Header printf'd so the body heredoc can stay QUOTED (backticks in the body must NOT execute).
+printf '\n## Weekly Review - %s\n' "$(date -u +%H:%M:%S)" >> "memory/$TODAY.md"
+cat >> "memory/$TODAY.md" << 'MEMEOF'
 
 ### Summary
 - Total tasks completed this week: X (all agents)
