@@ -72,7 +72,7 @@ Run these steps before any restart (hard or soft) and on context exhaustion.
    ```bash
    TODAY=$(date -u +%Y-%m-%d)
    # Header printf'd so the body heredoc can stay QUOTED (backticks in the body must NOT execute).
-   printf '\n   ## Session End - %s\n' "$(date -u +'%H:%M:%S UTC')" >> "memory/$TODAY.md"
+   printf '\n## Session End - %s\n' "$(date -u +'%H:%M:%S UTC')" >> "memory/$TODAY.md"
    cat >> "memory/$TODAY.md" << 'MEMEOF'
    - Status: [done/interrupted/context-full]
    - Current state: [where things stand — specific enough that the next session can resume cold]
