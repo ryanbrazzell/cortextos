@@ -755,6 +755,16 @@ export interface IPCRequest {
    * Optional for backwards compatibility — older clients fall back to 'unknown'.
    */
   source?: string;
+  /**
+   * disable-resurrection fix: for the `stop-agent` command, whether this stop was
+   * directly initiated by the user (`cortextos stop` / `cortextos disable`) — in
+   * which case a queued pendingRestart is DROPPED (stop wins) — vs an internal
+   * stop that is part of a larger restart (`cortextos restart`'s stop-half),
+   * which must set this to false so its own follow-up start-agent is honored via
+   * the pendingRestart path. The handler defaults to true when omitted so plain
+   * stop/disable keep "stop wins".
+   */
+  userInitiated?: boolean;
 }
 
 // Worker Types
@@ -808,4 +818,6 @@ export interface AgentStatus {
   sessionStart?: string;
   crashCount?: number;
   model?: string;
+  awaitingConfirmation?: boolean; // first-run observability fix: PTY parked on an
+  // interactive first-run prompt past the auto-accept backstop (wedged, not bootstrapped)
 }

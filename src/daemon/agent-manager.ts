@@ -19,6 +19,20 @@ import { stripBom } from '../utils/strip-bom.js';
 
 type LogFn = (msg: string) => void;
 
+// liveness fix: OS-level pid liveness probe using the same signal-0 idiom as
+// src/utils/lock.ts — signal 0 sends nothing, it only tests process existence +
+// our permission to signal it. We DELIBERATELY diverge from lock.ts on EPERM:
+// lock.ts treats every error as dead, but here a process owned by another user
+// (EPERM) is alive and must NOT be evicted — only ESRCH (process gone) is dead.
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
 /**
  * Manages all agents in a cortextOS instance.
  */
@@ -30,6 +44,11 @@ export class AgentManager {
   // Tracks agents that received a start request while still stopping.
   // stopAgent() honors these after cleanup completes so restart-all is race-free.
   private pendingRestarts: Set<string> = new Set();
+  // liveness fix: names currently being evicted+restarted. Claimed synchronously
+  // BEFORE the eviction's `await`, so a concurrent startAgent() for the same dead
+  // entry returns instead of double-spawning a PTY (same hazard class BUG-011's
+  // pendingRestarts guards for alive entries).
+  private evictingAgents: Set<string> = new Set();
   private instanceId: string;
   private ctxRoot: string;
   private frameworkRoot: string;
@@ -228,10 +247,32 @@ export class AgentManager {
    * restartAgent is unchanged — this read-only check exists purely to give
    * the IPC layer enough info to set IPCResponse.code. See issue #346.
    */
+  /**
+   * liveness fix: true liveness for a mapped agent — presence in this.agents is
+   * NOT proof of life. An entry is actually alive only if its AgentProcess
+   * reports a live status AND (for a running entry) its OS pid is actually alive.
+   * 'starting' is treated as alive with NO pid check: an in-flight start has not
+   * spawned a pid yet, and preempting it would break the BUG-011 in-flight-restart
+   * dedup. All other statuses (stopped/crashed/halted) — and 'running' with a
+   * dead/absent pid — are dead and eligible for eviction.
+   */
+  private isAgentActuallyAlive(name: string): boolean {
+    const entry = this.agents.get(name);
+    if (!entry) return false;
+    const { status, pid } = entry.process.getStatus();
+    if (status === 'starting') return true;   // in-flight start — never evict
+    if (status !== 'running') return false;   // stopped / crashed / halted => dead
+    return !!pid && isPidAlive(pid);           // running => must have a live pid
+  }
+
   inspectAgentOp(op: 'start' | 'stop' | 'restart', name: string): { ok: true } | { ok: false; code: 'DEDUPED' | 'NOT_FOUND'; message: string } {
     const inRegistry = this.agents.has(name);
     if (op === 'start') {
-      if (inRegistry) {
+      // liveness fix: only DEDUP a start against a genuinely-alive entry. A
+      // mapped-but-dead entry (halted/crashed/stopped, or a running entry whose
+      // pid is gone) must NOT report "already running" — startAgent will evict it
+      // and start fresh, so tell the caller the start is proceeding.
+      if (inRegistry && this.isAgentActuallyAlive(name)) {
         return { ok: false, code: 'DEDUPED', message: `start request for "${name}" deduped — agent already in registry (in-flight start or already running)` };
       }
       return { ok: true };
@@ -258,20 +299,57 @@ export class AgentManager {
       // the core stability test plan + cycle 2 of PR #13 both confirmed
       // this branch is dormant. Once we have weeks of zero-warning
       // production data, we can delete the queue mechanism entirely.
-      if (this.daemonJustCrashed) {
-        // Post-crash startup. The previous daemon exited via
-        // uncaughtException without running stopAll(), so the in-memory
-        // registry from the prior process is gone — but the post-crash
-        // discoverAndStart pass can briefly re-enter startAgent for an
-        // agent whose pendingRestarts entry survived. This is benign and
-        // distinct from the BUG-011 in-flight race PR #11 closed. Log at
-        // info level so operators don't think PR #11 has regressed.
-        console.log(`[agent-manager] ${name} already in registry (post-crash discovery overlap, expected). Queueing restart.`);
-      } else {
-        console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: ${name} still in registry during startAgent — pendingRestarts queueing engaged. This should not happen with PR #11 in place.`);
+      if (this.isAgentActuallyAlive(name)) {
+        // ALIVE entry: preserve the existing BUG-011/031/040 dedup/queue behavior
+        // EXACTLY — this is the legitimate in-flight-restart race path.
+        if (this.daemonJustCrashed) {
+          // Post-crash startup. The previous daemon exited via
+          // uncaughtException without running stopAll(), so the in-memory
+          // registry from the prior process is gone — but the post-crash
+          // discoverAndStart pass can briefly re-enter startAgent for an
+          // agent whose pendingRestarts entry survived. This is benign and
+          // distinct from the BUG-011 in-flight race PR #11 closed. Log at
+          // info level so operators don't think PR #11 has regressed.
+          console.log(`[agent-manager] ${name} already in registry (post-crash discovery overlap, expected). Queueing restart.`);
+        } else {
+          console.warn(`[agent-manager] BUG-011 REGRESSION CHECK: ${name} still in registry during startAgent — pendingRestarts queueing engaged. This should not happen with PR #11 in place.`);
+        }
+        this.pendingRestarts.add(name);
+        return;
       }
-      this.pendingRestarts.add(name);
-      return;
+      // liveness fix: entry exists but is NOT actually alive (halted/crashed/
+      // stopped, or a running entry whose OS pid is gone). Evict the stale entry
+      // and fall through to a fresh start rather than stranding the agent.
+      if (this.evictingAgents.has(name)) {
+        // A concurrent startAgent is already evicting+restarting this dead entry.
+        // Return instead of spawning a second PTY — the in-flight eviction will
+        // bring the agent up. Mirrors the alive in-flight dedup above.
+        console.log(`[agent-manager] ${name} eviction already in flight — skipping duplicate start.`);
+        return;
+      }
+      // Claimed synchronously BEFORE the eviction's `await` so a second caller
+      // hits the guard above. The fresh-start path below has NO await before
+      // `this.agents.set(name, ...)`, so once we release the marker and fall
+      // through, the new entry is mapped before any caller can interleave.
+      this.evictingAgents.add(name);
+      try {
+        console.log(`[agent-manager] ${name} in registry but not actually alive — evicting stale entry and starting fresh.`);
+        const stale = this.agents.get(name)!;
+        try { stale.poller?.stop(); } catch { /* best-effort */ }
+        try { stale.activityPoller?.stop(); } catch { /* best-effort */ }
+        try { stale.checker.stop(); } catch { /* best-effort */ }
+        // process.stop() sets status='stopped', which neutralizes any pending
+        // crash-backoff setTimeout on the old AgentProcess (its `if (status ===
+        // 'crashed')` guard now fails), so no orphan PTY is spawned after eviction.
+        try { await stale.process.stop(); } catch { /* best-effort */ }
+        this.agents.delete(name);
+        this.pendingRestarts.delete(name);
+        const staleScheduler = this.cronSchedulers.get(name);
+        if (staleScheduler) { staleScheduler.stop(); this.cronSchedulers.delete(name); }
+      } finally {
+        this.evictingAgents.delete(name);
+      }
+      // fall through synchronously to the fresh-start path below
     }
 
     // BUG-043 fix: resolve the agent's true org instead of using `this.org`.
@@ -858,7 +936,7 @@ export class AgentManager {
   /**
    * Stop a specific agent.
    */
-  async stopAgent(name: string): Promise<void> {
+  async stopAgent(name: string, userInitiated = false): Promise<void> {
     const entry = this.agents.get(name);
     if (!entry) {
       console.log(`[agent-manager] Agent ${name} not found`);
@@ -876,6 +954,17 @@ export class AgentManager {
     if (scheduler) {
       scheduler.stop();
       this.cronSchedulers.delete(name);
+    }
+
+    // disable-resurrection fix: an explicit user stop/disable must win against a
+    // racing queued restart. Drop the pending entry instead of honoring it.
+    // Internal callers (restartAgent, stopAll) pass userInitiated=false, so the
+    // BUG-011/BUG-031 restart-all honor path below is preserved unchanged.
+    if (userInitiated) {
+      if (this.pendingRestarts.delete(name)) {
+        console.log(`[agent-manager] Dropped queued restart for ${name} — explicit user stop/disable wins.`);
+      }
+      return;
     }
 
     // BUG-031: honor any restart that was queued while we were stopping.
@@ -964,7 +1053,14 @@ export class AgentManager {
   getAllStatuses(): AgentStatus[] {
     const statuses: AgentStatus[] = [];
     for (const [, entry] of this.agents) {
-      statuses.push(entry.process.getStatus());
+      const status = entry.process.getStatus();
+      // liveness fix: a mapped entry still reporting 'running' whose OS pid is
+      // gone is dead, not running. getStatus() returns a fresh object, so
+      // correcting .status here does not mutate AgentProcess internal state.
+      if (status.status === 'running' && (!status.pid || !isPidAlive(status.pid))) {
+        status.status = 'stopped';
+      }
+      statuses.push(status);
     }
     return statuses;
   }

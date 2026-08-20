@@ -21,7 +21,13 @@ export const restartCommand = new Command('restart')
     // before the IPC stop so the SessionEnd crash-alert hook does not fire a
     // false 🚨 CRASH alarm during the brief stop window. (BUG-036 pattern.)
     writeStopMarker(options.instance, agent, 'stopped via cortextos restart');
-    const stopResponse = await ipc.send({ type: 'stop-agent', agent, source: 'cortextos restart' });
+    // disable-resurrection fix: the stop-agent IPC handler is fire-and-forget, so
+    // the follow-up start-agent below races in while the agent is still registered
+    // and queues a pendingRestart. userInitiated:false lets stopAgent's honor path
+    // fire that queued restart (restoring pre-PR restart behavior); a plain user
+    // stop/disable (userInitiated defaults to true) would instead DROP it and stay
+    // down. This restart is NOT a stand-down — it must come back up.
+    const stopResponse = await ipc.send({ type: 'stop-agent', agent, source: 'cortextos restart', userInitiated: false });
     if (!stopResponse.success) {
       console.error(`  Stop failed: ${stopResponse.error}`);
       process.exit(1);

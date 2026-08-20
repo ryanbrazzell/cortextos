@@ -119,6 +119,13 @@ export class AgentProcess {
     // (e.g. if the previous stop() timed out before the PTY actually exited).
     // We're starting fresh — the new PTY has no pending stop.
     this.stopRequested = false;
+    // disable-resurrection fix: a fresh start means this agent is (re-)enabled.
+    // Clear any lingering .user-disable marker so handleExit's crash-recovery gate
+    // stops suppressing restarts for it. No-op if the marker is absent.
+    try {
+      const disableMarker = join(this.env.ctxRoot, 'state', this.name, '.user-disable');
+      if (existsSync(disableMarker)) unlinkSync(disableMarker);
+    } catch { /* best effort */ }
     // BUG-040 fix: bump generation. The onExit closure below captures THIS
     // value and uses it to detect "I'm an old PTY whose exit fired after a
     // new lifecycle began" — in which case it bails out without touching
@@ -382,6 +389,10 @@ export class AgentProcess {
       sessionStart: this.sessionStart?.toISOString(),
       crashCount: this.crashCount,
       model: this.config.model,
+      awaitingConfirmation:
+        this.pty && 'isAwaitingInteractiveConfirmation' in this.pty
+          ? this.pty.isAwaitingInteractiveConfirmation()
+          : false,
     };
   }
 
@@ -535,6 +546,22 @@ export class AgentProcess {
     // cleanup stays with agent-manager / hook-crash-alert per the existing
     // separation of concerns.
     if (this.isDaemonShuttingDown()) {
+      return;
+    }
+
+    // disable-resurrection fix: a DISABLED agent that exits (crash / force-exit
+    // with stopRequested=false) must NOT be respawned by crash recovery. The
+    // `.user-disable` marker (written by `cortextos disable`) is the authoritative
+    // "stood down by the user" signal — mirror isDaemonShuttingDown()'s check.
+    // Return BEFORE crash counting and BEFORE both respawn setTimeouts
+    // (image-poison ~L587, crash-recovery ~L643). status='stopped' so the agent
+    // shows as down, not crash-looping. Marker is cleared on the next start().
+    // Acknowledged edge case: the crash-alert hook lazy-unlinks markers older
+    // than 5min, so a disabled agent that survives stop() and keeps running
+    // >5min could theoretically lose this gate — outside the repro's scope.
+    if (this.isUserDisabled()) {
+      this.status = 'stopped';
+      this.notifyStatusChange();
       return;
     }
 
@@ -958,6 +985,24 @@ export class AgentProcess {
       if (!existsSync(marker)) return false;
       const ageMs = Date.now() - statSync(marker).mtimeMs;
       return ageMs < 60_000;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Check whether this agent has been explicitly disabled by the user.
+   *
+   * Returns true iff a `.user-disable` marker exists in this agent's state
+   * dir (written by `cortextos disable`). Unlike isDaemonShuttingDown()'s 60s
+   * freshness window, there is NO time bound here: `.user-disable` is a
+   * persistent flag with an explicit lifecycle (cleared on the next start()),
+   * not a transient shutdown signal.
+   */
+  private isUserDisabled(): boolean {
+    const marker = join(this.env.ctxRoot, 'state', this.name, '.user-disable');
+    try {
+      return existsSync(marker);
     } catch {
       return false;
     }

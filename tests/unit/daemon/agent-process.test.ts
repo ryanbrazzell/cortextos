@@ -9,6 +9,7 @@ const mockPty = {
   write: vi.fn(),
   getPid: vi.fn().mockReturnValue(12345),
   isAlive: vi.fn().mockReturnValue(true),
+  isAwaitingInteractiveConfirmation: vi.fn().mockReturnValue(false),
   onExit: vi.fn().mockImplementation((cb: (exitCode: number, signal?: number) => void) => {
     capturedOnExit = cb;
   }),
@@ -48,6 +49,7 @@ const fsMocks = {
   writeFileSync: vi.fn(),
   appendFileSync: vi.fn(),
   statSync: vi.fn(),
+  unlinkSync: vi.fn(),
 };
 
 vi.mock('fs', async () => {
@@ -76,6 +78,7 @@ vi.mock('fs', async () => {
     get writeFileSync() { return fsMocks.writeFileSync; },
     get appendFileSync() { return fsMocks.appendFileSync; },
     get statSync() { return fsMocks.statSync; },
+    get unlinkSync() { return fsMocks.unlinkSync; },
   };
 });
 
@@ -98,6 +101,8 @@ beforeEach(() => {
   mockPty.write.mockClear();
   mockPty.isAlive.mockClear();
   mockPty.isAlive.mockReturnValue(true);
+  mockPty.isAwaitingInteractiveConfirmation.mockClear();
+  mockPty.isAwaitingInteractiveConfirmation.mockReturnValue(false);
   mockPty.onExit.mockClear();
   mockInjectMessage.mockClear();
   fsMocks.existsSync.mockReset().mockReturnValue(false);
@@ -105,6 +110,7 @@ beforeEach(() => {
   fsMocks.writeFileSync.mockReset();
   fsMocks.appendFileSync.mockReset();
   fsMocks.statSync.mockReset();
+  fsMocks.unlinkSync.mockReset();
 });
 
 describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
@@ -268,6 +274,44 @@ describe('AgentProcess - BUG-011 fix (stop awaits PTY exit)', () => {
     // the PTY dies must already see the marker, or it classifies a false crash.
     const markerWriteOrder = fsMocks.writeFileSync.mock.invocationCallOrder[writeIdx];
     expect(markerWriteOrder).toBeLessThan(stopSpy.mock.invocationCallOrder[0]);
+  });
+});
+
+describe('AgentProcess - disable-resurrection fix (.user-disable gate)', () => {
+  it('disabled agent force-exit does NOT trigger crash recovery', async () => {
+    // A disabled agent that force-exits/crashes arrives at handleExit with
+    // stopRequested=false. The .user-disable marker must gate crash recovery.
+    fsMocks.existsSync.mockImplementation((p: any) =>
+      String(p).endsWith('/state/alice/.user-disable'),
+    );
+
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    // Force-exit with a non-zero code (would be a crash on old code).
+    capturedOnExit!(1, 0);
+
+    // handleExit returns early via the isUserDisabled() gate: status is
+    // 'stopped' (down, not crash-looping) and NO crash-recovery side effect
+    // (the restarts.log CRASH append) fired.
+    expect(ap.getStatus().status).toBe('stopped');
+    expect(fsMocks.appendFileSync).not.toHaveBeenCalled();
+  });
+
+  it('start() clears a lingering .user-disable marker (re-enabled agent crash-recovers again)', async () => {
+    const markerPath = '/tmp/test-ctx/state/alice/.user-disable';
+    // Marker present at start → start() must unlink it (agent re-enabled).
+    fsMocks.existsSync.mockImplementation((p: any) => String(p) === markerPath);
+
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    expect(fsMocks.unlinkSync).toHaveBeenCalledWith(markerPath);
+
+    // Marker now gone → a subsequent crash recovers normally.
+    fsMocks.existsSync.mockReturnValue(false);
+    capturedOnExit!(1, 0);
+    expect(ap.getStatus().status).toBe('crashed');
   });
 });
 
@@ -464,5 +508,22 @@ describe('AgentProcess - onboarding marker (do not auto-write .onboarded on hear
     const prompt = mockPty.spawn.mock.calls[0]?.[1] ?? '';
     expect(prompt).not.toContain('FIRST BOOT');
     expect(prompt).not.toContain('complete the onboarding protocol');
+  });
+});
+
+describe('AgentProcess - first-run observability (awaitingConfirmation)', () => {
+  it('surfaces awaitingConfirmation when the PTY reports a first-run wedge', async () => {
+    mockPty.isAwaitingInteractiveConfirmation.mockReturnValue(true);
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    expect(ap.getStatus().awaitingConfirmation).toBe(true);
+  });
+
+  it('reports awaitingConfirmation falsy for a normal running agent', async () => {
+    const ap = new AgentProcess('alice', mockEnv, {});
+    await ap.start();
+
+    expect(ap.getStatus().awaitingConfirmation).toBeFalsy();
   });
 });

@@ -67,3 +67,10 @@ WINDOWS_INSTALL_REPORT.md
 *INSTALL_REPORT.md
 /PHASE*-REPORT.md
 docs/phase-reports/
+
+# claude-to-codex-migration leakage-guard fixture (author-specific ban tokens: fleet
+# roster + specific chat-ids). CI/local ONLY, pointed at by CTX_LEAKAGE_FIXTURE. NEVER
+# public — glob'd broadly so it can never be accidentally committed into the tree.
+leakage-fixture.json
+**/leakage-fixture.json
+*.leakage-fixture.json

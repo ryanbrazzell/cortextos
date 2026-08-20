@@ -620,7 +620,7 @@ export class IPCServer {
             response = { success: false, error: 'Agent name required', code: 'INVALID_INPUT' };
           } else {
             const insp = this.agentManager.inspectAgentOp('stop', request.agent);
-            this.agentManager.stopAgent(request.agent)
+            this.agentManager.stopAgent(request.agent, request.userInitiated ?? true)
               .catch(err => console.error(`Failed to stop ${request.agent}:`, err));
             if (insp.ok) {
               response = { success: true, data: `Stopping ${request.agent}` };
